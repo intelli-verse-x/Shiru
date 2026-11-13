@@ -31,7 +31,21 @@
   /** @type {import('@/modules/providers/anilist/al.d.ts').Media | null} */
   let media
   $: media = fromCache($mediaCache, media ?? mediaCache.value[data.media?.id])
-  let zeroEpisode = checkForZero(media).then(_zeroEpisode => (zeroEpisode = _zeroEpisode))
+  let zeroEpisode = null
+  let zeroEpisodeRequest = 0
+  $: updateZeroEpisode(media)
+
+  async function updateZeroEpisode(currentMedia) {
+    const request = ++zeroEpisodeRequest
+    zeroEpisode = null
+    if (!currentMedia?.id) return
+    try {
+      const result = await checkForZero(currentMedia)
+      if (request === zeroEpisodeRequest && media === currentMedia) zeroEpisode = result
+    } catch {
+      // An unavailable lookup must not make the episode offset truthy.
+    }
+  }
   $: episodeRange = episodesList.handleArray(data?.episode, data?.parseObject?.file_name)
   $: lastEpisode = (data?.episodeRange || data?.parseObject?.episodeRange)?.last || episodeRange?.last || (isValidNumber(data?.episode) && (data?.episode + (zeroEpisode ? 1 : 0))) || (media?.episodes === 1 && media?.episodes)
   $: hasSpoiler = $settings.spoilerStatus.includes(media?.mediaListEntry?.status ?? 'NOTONLIST')
@@ -129,6 +143,7 @@
     sinceInterval.unref?.()
   })
   onDestroy(() => {
+    zeroEpisodeRequest++
     document.removeEventListener('pointerup', handleOutsideClick)
     container?.removeEventListener?.('focusout', handleBlur)
     clearTimeouts()

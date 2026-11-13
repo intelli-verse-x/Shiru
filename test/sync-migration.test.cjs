@@ -133,3 +133,63 @@ test('a failed saved lookup preserves an already resolved valid mapping', async 
   assert.equal(unresolved.length, 0)
   assert.equal(file.media, mapping)
 })
+
+// Exercise the actual reactive lookup method with controlled promise order. The
+// hosted Svelte checker and desktop compilation also compile the component.
+const cardSource = readFileSync(join(__dirname, '../common/components/cards/EpisodeCard.svelte'), 'utf8')
+const zeroStart = cardSource.indexOf('  let zeroEpisode =')
+const zeroEnd = cardSource.indexOf('  $: episodeRange =', zeroStart)
+assert.ok(zeroStart > 0 && zeroEnd > zeroStart)
+function zeroLookup(checkForZero) {
+  const block = cardSource.slice(zeroStart, zeroEnd)
+  assert.match(block, /\$:\s*updateZeroEpisode\(media\)/)
+  return vm.runInNewContext(`(() => {
+    let media
+    ${block.replace('$: updateZeroEpisode(media)', '')}
+    return {
+      update: value => { media = value; return updateZeroEpisode(value) },
+      value: () => zeroEpisode
+    }
+  })()`, { checkForZero })
+}
+
+test('zero-episode detection waits for actual media and starts with a non-truthy offset', async () => {
+  const calls = []
+  const state = zeroLookup(async media => { calls.push(media.id); return true })
+  assert.equal(state.value(), null)
+  await state.update(undefined)
+  assert.equal(calls.length, 0)
+  await state.update({ id: 42 })
+  assert.deepEqual(calls, [42])
+  assert.equal(state.value(), true)
+})
+
+test('zero-episode lookup stays non-truthy while pending and ignores stale media responses', async () => {
+  const pending = new Map()
+  const state = zeroLookup(media => new Promise(resolve => pending.set(media.id, resolve)))
+  const first = state.update({ id: 1 })
+  assert.equal(state.value(), null)
+  const second = state.update({ id: 2 })
+  pending.get(2)(false)
+  await second
+  assert.equal(state.value(), false)
+  pending.get(1)(true)
+  await first
+  assert.equal(state.value(), false)
+})
+
+test('clearing the media invalidates an outstanding zero-episode lookup', async () => {
+  let finish
+  const state = zeroLookup(() => new Promise(resolve => { finish = resolve }))
+  const request = state.update({ id: 42 })
+  await state.update(undefined)
+  finish(true)
+  await request
+  assert.equal(state.value(), null)
+})
+
+test('failed zero-episode lookup retains a non-truthy offset', async () => {
+  const state = zeroLookup(async () => { throw new Error('offline') })
+  await state.update({ id: 42 })
+  assert.equal(state.value(), null)
+})
