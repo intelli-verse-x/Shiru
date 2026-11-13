@@ -67,7 +67,7 @@ Want to contribute code? Great! Here's how:
 
 ### 📋 Prerequisites
 
-- **pnpm 10.34.1**
+- **pnpm 12.17.0**
 - **Node.js 24.22.1**
 - **Visual Studio 2022** (if on Windows)
 - **Docker** (with WSL if on Windows)

@@ -759,9 +759,9 @@ export default class TorrentClient {
       if (completed) completed.media = media
       return media
     }).catch(error => {
-      if (overwrite) throw error
-      debug('Could not migrate torrent media, dropping mapping:', hash, error)
-      return {}
+      debug('Could not save torrent media:', hash, error)
+      // Upgrade callers must retain the old mapping when persistence fails.
+      throw error
     })
     this.mediaWrites.set(hash, pending)
     if (torrent) torrent._cacheWrite = pending.then(() => {}, () => {})

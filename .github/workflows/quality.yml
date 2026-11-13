@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup PNPM
         uses: pnpm/action-setup@v6
@@ -32,8 +34,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
+      - name: Check isolated metadata migration regressions
+        run: node --test test/sync-migration.test.cjs
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Run Quality Checks
         run: pnpm check
+
+      - name: Compile desktop bundles without packaging or publishing
+        run: pnpm --dir electron run web:build
