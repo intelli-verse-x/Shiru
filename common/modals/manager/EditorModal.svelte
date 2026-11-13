@@ -3,7 +3,7 @@
   import SoftModal from '@/components/modals/SoftModal.svelte'
   import SearchPage from '@/routes/search/SearchPage.svelte'
   import { click } from '@/modules/lib/click.js'
-  import { setHash } from '@/modules/anime/animehash.js'
+  import { setTorrentMedia } from '@/modules/torrent.js'
   import { modal } from '@/modules/navigation.js'
   import { X } from 'lucide-svelte'
 
@@ -21,28 +21,22 @@
       search: title,
       ...structuredClone(searchDefaults),
       fileEdit: (media) => {
-        const mediaId = _file.media?.mediaId
-        const targetEpisode = _file.media.episode || _file.media.parseObject.episode_number
+        const mediaId = _file.media?.media?.id ?? _file.media?.anilist_id
+        const targetEpisode = _file.media.episode ?? _file.media.parseObject.episode_number
         for (const file of files) {
-          const episode = file.media?.episode || file.media?.parseObject?.episode_number
-          if ((_file === file || (!file.locked && !file.media?.locked)) && ((!mediaId && !file.media?.mediaId) || (mediaId === file.media?.mediaId && (_file === file || ((!/^\d+$/.test(targetEpisode) || Number(targetEpisode) !== 0) && (!/^\d+$/.test(episode) || Number(episode) !== 0)))))) {
+          const episode = file.media?.episode ?? file.media?.parseObject?.episode_number
+          const fileMediaId = file.media?.media?.id ?? file.media?.anilist_id
+          if ((_file === file || (!file.locked && !file.media?.locked)) && ((!mediaId && !fileMediaId) || (mediaId === fileMediaId && (_file === file || ((!/^\d+$/.test(targetEpisode) || Number(targetEpisode) !== 0) && (!/^\d+$/.test(episode) || Number(episode) !== 0)))))) {
             if (_file === file) file.locked = true
             file.media.media = media
             if (file.media.parseObject.anime_season) file.media.parseObject.anime_season = '1'
             file.media.season = '1'
             file.media.parseObject.anime_title = media.title.userPreferred
-            file.media.mediaId = media.id
+            file.media.anilist_id = media.id
+            file.media.mal_id = media.idMal
             file.media.failed = false
-            setHash(file.infoHash, {
-              fileHash: file.fileHash,
-              mediaId: file.media.mediaId,
-              episodeRange: file.media.episodeRange,
-              episode,
-              season: file.media.season || file.media.parseObject.anime_season,
-              parseObject: file.media.parseObject,
-              ...(file.locked ? { locked: true } : {}),
-              failed: false
-            })
+            file.media.parseObject.failed = false
+            setTorrentMedia(file.infoHash, { ...file.media, locked: !!(file.locked || file.media.locked) }, file.path)
           }
         }
         window.dispatchEvent(new Event('fileEdit', { detail: { manager: true } }))
@@ -52,8 +46,8 @@
     modal.open(modal.FILE_EDITOR, writable(search))
   }
 </script>
-<SoftModal class='w-full mx-20 h-full rounded scrollbar-none bg-very-dark' innerCss='pt-safe-area' bind:showModal={$modal[modal.FILE_EDITOR]} {close} id={modal.FILE_EDITOR}>
-  <div class='d-flex mt-10'>
+<SoftModal class='w-full mx-20 h-full rounded scrollbar-none bg-very-dark' innerCss='pt-20' bind:showModal={$modal[modal.FILE_EDITOR]} {close} id={modal.FILE_EDITOR}>
+  <div class='d-flex' style='margin-top: max(calc(var(--safe-area-top) - 3rem), 1rem)'>
     <div class='details'>
       <h3 class='mb-0 font-weight-bold text-white title font-size-24 ml-20 line-height-1'>Select a Series</h3>
       <h4 class='mb-0 text-muted title font-size-12 ml-20 line-height-1'>Click or tap the series that is currently playing.</h4>

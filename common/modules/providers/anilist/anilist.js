@@ -6,7 +6,7 @@ import { alToken, settings, validateToken } from '@/modules/settings.js'
 import { malDubs } from '@/modules/anime/animedubs.js'
 import { isSubbedProgress, getMediaMaxEp } from '@/modules/anime/anime.js'
 import { getRandomInt, sleep, debounce, uniqueStore, normalizeASCII, codes } from '@/modules/util.js'
-import { printError, status } from '@/modules/networking.js'
+import { printError, status, previousStatus } from '@/modules/networking.js'
 import { cache, caches, mediaCache } from '@/modules/cache.js'
 import { MutationQueue } from '@/modules/providers/lib/mutationqueue.js'
 import { malClient } from '@/modules/providers/myanimelist/myanimelist.js'
@@ -80,6 +80,7 @@ isAdult,
 bannerImage,
 synonyms,
 popularity,
+trending,
 stats {
   scoreDistribution {
     score,
@@ -158,16 +159,21 @@ recommendations {
 
 class AnilistClient {
   limiter = new Bottleneck({
-    reservoir: 90,
-    reservoirRefreshAmount: 90,
-    reservoirRefreshInterval: 60 * 1_000,
+    reservoir: 30, // should be 90 but api is heavily degraded...
+    reservoirRefreshAmount: 30, // should be 90 but api is heavily degraded...
+    reservoirRefreshInterval: 64 * 1_000,
     maxConcurrent: 10,
-    minTime: 100
+    minTime: 260 // burst limit is 4 rq/s
   })
 
   rateLimitPromise = null
+  rateLimitUntil = 0
+  searchSnapshots = new Map()
 
   #listPromise = Promise.resolve()
+
+  #isFlushingMutations = false
+  #fetchingLists = 0
 
   /** @type {import('simple-store-svelte').Writable<ReturnType<AnilistClient['getUserLists']>>} */
   userLists = writable()
@@ -176,21 +182,47 @@ class AnilistClient {
 
   userID = alToken
 
+  _status = status.value
+
   constructor() {
     debug('Initializing Anilist Client for ID ' + this.userID?.viewer?.data?.Viewer?.id)
+    this.limiter.on('depleted', async () => {
+      trace('AniList limiter reservoir depleted, jobs will queue until next refresh')
+      if (status.value !== 'online') return
+      status.set('limited_anilist')
+      while ((await this.limiter.currentReservoir()) <= 0) {
+        await sleep(100)
+      }
+      if (status.value === 'limited_anilist') status.set('online')
+    })
     this.limiter.on('failed', async (error, jobInfo) => {
       if (status.value.match(/offline/i)) throw new Error('Failed making request to Anilist, network is offline... not retrying')
-      else if (error.status === 429 || jobInfo.retryCount >= 1) await printError('Search Failed', 'Failed making request to Anilist! Trying again in a minute.', error, 20_000)
-      const errorDebug = `Error: ${error.status || 429} - ${error.message || error.statusText || codes[error.status || 429]}`
+      else if (jobInfo.retryCount >= 1 && error.status !== 429) await printError('Search Failed', 'Failed making request to Anilist!', error, 20_000)
+      const errorTrace = `Error: ${error.status || 429} - ${error.message || error.statusText || codes[error.status || 429]}`
 
       if (error.status === 429) { // rate limited...
-        const time = (Number(error.headers.get('retry-after') || 60) + 1) * 1_000
-        if (!this.rateLimitPromise) this.rateLimitPromise = sleep(time).then(() => { this.rateLimitPromise = null })
-        return time
+        const resetHeader = error.headers?.get('x-ratelimit-reset')
+        const retryHeader = error.headers?.get('retry-after')
+        const resetAt = Number(resetHeader)
+        const retryAfter = Number(retryHeader)
+        const resetTime = resetHeader != null && Number.isFinite(resetAt) && resetAt > 0 ? Math.max((resetAt * 1_000) - Date.now(), 0) + 1_000 : 0
+        const retryTime = retryHeader != null && Number.isFinite(retryAfter) && retryAfter >= 0 ? (retryAfter + 1) * 1_000 : 0
+        this.rateLimitUntil = Math.max(this.rateLimitUntil, Date.now() + (Math.max(resetTime, retryTime) || 64_000))
+        if (!this.rateLimitPromise) {
+          this._status = status.value
+          this.rateLimitPromise = (async () => {
+            while (this.rateLimitUntil > Date.now()) await sleep(this.rateLimitUntil - Date.now())
+            this.rateLimitUntil = 0
+            this.rateLimitPromise = null
+            if (status.value === 'limited_anilist') status.set(this._status)
+          })()
+        }
+        if (!status.value.match(/offline/i) && status.value !== 'limited_anilist' && (this.rateLimitUntil - Date.now()) > 6_000) status.set('limited_anilist')
+        return
       }
 
       if (jobInfo.retryCount >= 1) { // give up after 2 total attempts, let it reject so callers can fall back
-        debug(`Giving up on request after ${jobInfo.retryCount + 1} attempts`, errorDebug)
+        trace(`Giving up on request after ${jobInfo.retryCount + 1} attempts`, errorTrace)
         return
       }
 
@@ -203,7 +235,7 @@ class AnilistClient {
       setTimeout(() => {
         this.getUserLists({ sort: 'UPDATED_TIME_DESC' }).then(updatedLists => {
           this.userLists.value = Promise.resolve(updatedLists) // no need to have userLists await the entire query process while we already have previous values, (it's awful to wait 15+ seconds for the query to succeed with large lists)
-          this.#flushMutationQueue()
+          return this.#flushMutationQueue()
         }).catch(error => debug('Failed to update user lists on init, this is likely a temporary connection issue:', error))
       }).unref?.()
       this.findNewNotifications().catch((error) => debug('Failed to get new anilist notifications at the scheduled interval, this is likely a temporary connection issue:', JSON.stringify(error)))
@@ -211,68 +243,79 @@ class AnilistClient {
       setInterval(() => {
         this.getUserLists({ sort: 'UPDATED_TIME_DESC' }).then(updatedLists => {
           this.userLists.value = Promise.resolve(updatedLists) // no need to have userLists await the entire query process while we already have previous values, (it's awful to wait 15+ seconds for the query to succeed with large lists)
-          this.#flushMutationQueue()
+          return this.#flushMutationQueue()
         }).catch(error => debug('Failed to update user lists at the scheduled interval, this is likely a temporary connection issue:', error))
       }, 1_000 * 60 * 15)
       // check notifications every 5 mins
       setInterval(() => this.findNewNotifications().catch((error) => debug('Failed to get new anilist notifications at the scheduled interval, this is likely a temporary connection issue:', JSON.stringify(error))), 1_000 * 60 * 5)
       // update userLists and flush queued offline mutations when back online
       uniqueStore(status).subscribe(value => {
-        if (value !== 'online') return
+        if (!(previousStatus.value.match(/offline/i) && value === 'online')) return
         debug(`Back online${this.mutationQueue.hasPending ? ' with pending mutations' : ''}, refreshing user lists`)
         this.getUserLists({ sort: 'UPDATED_TIME_DESC' }, false, true).then(updatedLists => {
           this.userLists.value = Promise.resolve(updatedLists)
-          if (this.mutationQueue.hasPending) this.#flushMutationQueue()
+          if (this.mutationQueue.hasPending) return this.#flushMutationQueue()
         }).catch(error => debug('Failed to refresh user lists after coming online:', error))
       })
     } else {
       uniqueStore(status).subscribe(value => {
-        if (value !== 'online' || !this.mutationQueue.hasPending) return
+        if (!(previousStatus.value.match(/offline/i) && value === 'online') || !this.mutationQueue.hasPending) return
         debug('Back online with pending mutations, flushing mutation queue...')
-        this.#flushMutationQueue()
+        this.#flushMutationQueue().catch(error => debug('Failed to replay mutations after coming online:', error))
       })
     }
   }
 
   numberOfQueries = 0
   /** @type {(options: RequestInit) => Promise<any>} */
-  handleRequest = this.limiter.wrap(async opts => {
-    await this.rateLimitPromise
-    // Skip using token if its expired, causes fetch to fail for queries that do not need a token.
-    if (opts.headers.Authorization && this.userID && this.userID.reauth && this.userID.token === opts.headers.Authorization && (!this.userID.expires_in || (Math.floor(Date.now() / 1_000) >= (this.userID.expires_in + 30 * 24 * 60 * 60)))) delete opts.headers.Authorization
-    validateToken(opts.headers.Authorization)
-    if (status.value.match(/offline/i)) throw new Error('AniList API is temporarily disabled or network is offline')
-    trace(`[${this.numberOfQueries}] requesting`, JSON.stringify({ ...opts, headers: { ...opts.headers, Authorization: opts.headers.Authorization ? '[redacted]' : undefined } }))
-    this.numberOfQueries++
-    let res = {}
+  handleRequest = async opts => {
+    if (this.rateLimitPromise) await this.rateLimitPromise
     try {
-      res = await fetch('https://graphql.anilist.co', opts)
-    } catch (e) {
-      if (!res || res.status !== 404) throw e
-    }
-    if (!res.ok && (res.status === 429 || res.status >= 500)) {
-      throw res
-    }
-    let json = null
-    try {
-      json = await res.json()
-    } catch (error) {
-      if (res.ok) printError('Search Failed', 'Failed making request to Anilist! Try again in a minute.', error)
-    }
-    if (!res.ok && res.status !== 404) {
-      if (json) {
-        for (const error of json?.errors || []) {
-          if (error.status === 400 && error.message?.match(/invalid token/i) && opts.headers.Authorization && !validateToken(opts.headers.Authorization, true)) {
-            return { data: null, errors: [{ message: 'AniList session has expired. Please go to Profiles and log in again to continue syncing.', status: 401 }] }
-          }
-          printError('Search Failed', 'Failed making request to Anilist! Try again in a minute.', error)
+      return await this.limiter.schedule(async () => {
+        // Skip using token if its expired, causes fetch to fail for queries that do not need a token.
+        if (opts.headers.Authorization && this.userID && this.userID.reauth && this.userID.token === opts.headers.Authorization && (!this.userID.expires_in || (Math.floor(Date.now() / 1_000) >= (this.userID.expires_in + 30 * 24 * 60 * 60)))) {
+          delete opts.headers.Authorization
         }
-      } else {
-        printError('Search Failed', 'Failed making request to Anilist! Try again in a minute.', res)
-      }
+        validateToken(opts.headers.Authorization)
+        if (status.value.match(/offline/i)) throw new Error('AniList API is temporarily disabled or network is offline')
+        const numberOfQueries = this.numberOfQueries
+        trace(`[${numberOfQueries}] requesting`, JSON.stringify(this.limiter.counts()), JSON.stringify({ ...opts, headers: { ...opts.headers, Authorization: opts.headers.Authorization ? '[redacted]' : undefined } }))
+        this.numberOfQueries++
+        let res = {}
+        try {
+          res = await fetch('https://graphql.anilist.co', opts)
+        } catch (e) {
+          if (!res || res.status !== 404) throw e
+        }
+        trace(`[${numberOfQueries}] request settled`, JSON.stringify({ status: res?.status, limit: res.headers?.get('x-ratelimit-limit'), remaining: res.headers?.get('x-ratelimit-remaining'), reset: res.headers?.get('x-ratelimit-reset'), retryAfter: res.headers?.get('retry-after') }))
+        if (!res.ok && (res.status === 429 || res.status >= 500)) {
+          throw res
+        }
+        let json = null
+        try {
+          json = await res.json()
+        } catch (error) {
+          if (res.ok) printError('Search Failed', 'Failed making request to Anilist!', error)
+        }
+        if (!res.ok && res.status !== 404) {
+          if (json) {
+            for (const error of json?.errors || []) {
+              if (error.status === 400 && error.message?.match(/invalid token/i) && opts.headers.Authorization && !validateToken(opts.headers.Authorization, true)) {
+                return { data: null, errors: [{ message: 'AniList session has expired. Please go to Profiles and log in again to continue syncing.', status: 401 }] }
+              }
+              printError('Search Failed', 'Failed making request to Anilist!', error)
+            }
+          } else {
+            printError('Search Failed', 'Failed making request to Anilist!', res)
+          }
+        }
+        return json || res
+      })
+    } catch (error) {
+      if (error?.status !== 429) throw error
+      return this.handleRequest(opts)
     }
-    return json || res
-  })
+  }
 
   /**
    * @param {string} query
@@ -287,6 +330,9 @@ class AnilistClient {
         ...variables
       }
     }
+    delete vars.variables.token
+    delete vars.variables.refresh_in
+    delete vars.variables.tokenUserId
     if (vars?.variables?.sort === 'OMIT') { delete vars.variables.sort }
 
     /** @type {RequestInit} */
@@ -311,7 +357,7 @@ class AnilistClient {
   /** @returns {Promise<import('./al.d.ts').Query<{ Viewer: import('./al.d.ts').Viewer }>>} */
   viewer (variables = {}) {
     debug('Getting viewer')
-    const query = /* js */` 
+    const query = /* js */`
     query {
       Viewer {
         avatar {
@@ -361,8 +407,8 @@ class AnilistClient {
           })
         }
       }
+      if ((newNotifications?.length > 0) || (lastNotified <= 1)) cache.setEntry(caches.NOTIFICATIONS, 'lastAni', Date.now() / 1_000)
     }
-    if ((newNotifications?.length > 0) || (lastNotified <= 1)) cache.setEntry(caches.NOTIFICATIONS, 'lastAni', Date.now() / 1_000)
   }
 
   /** @returns {Promise<import('./al.d.ts').PagedQuery<{ notifications: { id: number, type: string, createdAt: number, episode: number, media: import('./al.d.ts').Media}[] }>>} */
@@ -427,8 +473,7 @@ class AnilistClient {
     const cachedEntry = !ignoreCache && this.sortListEntries(userSort, await cache.cachedEntry(caches.USER_LISTS, JSON.stringify(variables), ignoreExpiry || status.value.match(/offline/i)))
     if (cachedEntry) return cachedEntry
 
-    this.mutationQueue.isFetchingList = true
-    const query = /* js */` 
+    const query = /* js */`
       query($id: Int, $sort: [MediaListSort]) {
         MediaListCollection(userId: $id, type: ANIME, sort: $sort, forceSingleCompletedList: true) {
           lists {
@@ -441,29 +486,34 @@ class AnilistClient {
           }
         }
       }`
-    let res
-    for (let attempt = 1; attempt <= 3; attempt++) { // VERY large user lists can sometimes result in a timeout, typically trying again succeeds.
-      res = await this.alRequest(query, variables)
-      if (res?.data?.MediaListCollection) break
-      if (attempt < 3) { // stupid fix... probably could be improved...
-        debug(`Error fetching user lists, attempt ${attempt} failed. Retrying in 5 seconds...`)
-        await new Promise(resolve => setTimeout(resolve, 5_000).unref?.())
-      } else {
-        debug('Failed fetching user lists. Maximum of 3 attempts reached, giving up.')
+    this.#fetchingLists++
+    this.mutationQueue.isFetchingList = true
+    try {
+      let res
+      for (let attempt = 1; attempt <= 3; attempt++) { // VERY large user lists can sometimes result in a timeout, typically trying again succeeds.
+        res = await this.alRequest(query, variables)
+        if (res?.data?.MediaListCollection) break
+        if (attempt < 3) { // stupid fix... probably could be improved...
+          debug(`Error fetching user lists, attempt ${attempt} failed. Retrying in 5 seconds...`)
+          await new Promise(resolve => setTimeout(resolve, 5_000).unref?.())
+        } else {
+          debug('Failed fetching user lists. Maximum of 3 attempts reached, giving up.')
+        }
       }
-    }
 
-    const result = await cache.cacheEntry(caches.USER_LISTS, JSON.stringify(variables), variables, res, Date.now() + 14 * 60 * 1_000) // expire after 14 minutes as this will be re-cached by our 15-minute interval.
-    this.mutationQueue.isFetchingList = false
-    return this.sortListEntries(userSort, result)
+      const result = await cache.cacheEntry(caches.USER_LISTS, JSON.stringify(variables), variables, res, Date.now() + 14 * 60 * 1_000) // expire after 14 minutes as this will be re-cached by our 15-minute interval.
+      return this.sortListEntries(userSort, result)
+    } finally {
+      this.#fetchingLists--
+      this.mutationQueue.isFetchingList = this.#fetchingLists > 0
+    }
   }
 
   /**
    * Sorts the media list entries based on the specified sorting criteria.
    * UPDATED_TIME_DESC should be the default sort for the data, so if this is used the list will not be sorted.
-   *
-   * @param {string} sort - The sorting type (e.g., 'STARTED_ON_DESC', 'FINISHED_ON_DESC').
-   * @param {Object} data - The media list data containing the lists and entries.
+   * @param {string} sort The sorting type (e.g., 'STARTED_ON_DESC', 'FINISHED_ON_DESC').
+   * @param {Object} data The media list data containing the lists and entries.
    * @returns {Object} The reorganized media list with sorted entries.
    */
   sortListEntries(sort, data) {
@@ -476,13 +526,14 @@ class AnilistClient {
           return entry?.media?.mediaListEntry?.startedAt ? (entry.media.mediaListEntry.startedAt.year || 0) * 10_000 + (entry.media.mediaListEntry.startedAt.month || 0) * 100 + (entry.media.mediaListEntry.startedAt.day || 0) : 0
         case 'FINISHED_ON_DESC':
           return entry?.media?.mediaListEntry?.completedAt ? (entry.media.mediaListEntry.completedAt.year || 0) * 10_000 + (entry.media.mediaListEntry.completedAt.month || 0) * 100 + (entry.media.mediaListEntry.completedAt.day || 0) : 0
-        case 'PROGRESS_DESC':
+        case 'PROGRESS_DESC': {
           const totalEpisodes = entry?.media?.episodes ?? getMediaMaxEp(entry?.media) ?? 0
           const progress = entry?.media?.mediaListEntry?.progress ?? 0
           if (progress === 0) return Infinity
           if (totalEpisodes === 0) return -progress
           const distance = totalEpisodes - progress
           return distance <= 0 ? -Infinity : distance
+        }
         case 'USER_SCORE_DESC': // doesn't exist, AniList uses SCORE_DESC for both MediaSort and MediaListSort.
           return entry?.media?.mediaListEntry?.score || 0
         case 'UPDATED_TIME_DESC':
@@ -507,7 +558,7 @@ class AnilistClient {
   async entry(variables) {
     debug(`Updating entry for ${variables.id}`)
 
-    const progressBefore = this.mutationQueue.getProgressBefore(variables.id) ?? cache.getMedia(variables.id)?.mediaListEntry?.progress ?? null
+    const progressBefore = this.mutationQueue.getProgressBefore(variables.id, variables) ?? (!variables.token ? cache.getMedia(variables.id)?.mediaListEntry?.progress : null) ?? null
     if (status.value.match(/offline/i) && settings.value.offlineSync) {
       debug(`We are offline and offline syncing is enabled, queuing entry update for media ${variables.id}`)
       this.mutationQueue.enqueue('entry', variables.id, variables, null, progressBefore, false)
@@ -535,10 +586,12 @@ class AnilistClient {
           }
         }
       }`
+    const pendingBefore = this.mutationQueue.getPending(variables.id, variables)
     const res = await this.alRequest(query, variables)
     const listEntry = res?.data?.SaveMediaListEntry
+    if (res?.errors?.length || !listEntry) return
     if (!variables.token) {
-      this.mutationQueue.enqueue('entry', variables.id, variables, listEntry, progressBefore)
+      this.mutationQueue.enqueue('entry', variables.id, variables, listEntry, progressBefore, true, pendingBefore)
       await this.updateListEntry(variables.id, listEntry)
     }
     //TODO: need to implement "else" for anilist syncing functionality. #updateListEntry
@@ -561,9 +614,11 @@ class AnilistClient {
           deleted
         }
       }`
+    const pendingBefore = this.mutationQueue.getPending(variables.idAni, variables)
     const res = await this.alRequest(query, variables)
+    if (res?.errors?.length || res?.data?.DeleteMediaListEntry?.deleted !== true) return
     if (!variables.token) {
-      this.mutationQueue.enqueue('delete', variables.idAni, variables, null)
+      this.mutationQueue.enqueue('delete', variables.idAni, variables, null, null, true, pendingBefore)
       await this.deleteListEntry(variables.idAni)
     }
     //TODO: need to implement "else" for anilist syncing functionality. #deleteListEntry
@@ -613,9 +668,7 @@ class AnilistClient {
     return await result
   }
 
-  /**
-   * @param {{key: string, title: string, year?: string, isAdult: boolean}[]} flattenedTitles
-   **/
+  /** @param {{key: string, title: string, year?: string, isAdult: boolean}[]} flattenedTitles */
   async alSearchCompound(flattenedTitles) {
     debug(`Searching for ${flattenedTitles?.length} titles via compound search`)
     const cachedEntry = cache.cachedEntry(caches.QUERY_COMPOUND, JSON.stringify(flattenedTitles),  status.value.match(/offline/i))
@@ -646,7 +699,7 @@ class AnilistClient {
     query(${queryVariables}) {
       ${fragmentQueries}
     }
-    
+
     fragment&nbsp;med&nbsp;on&nbsp;Media {
       id,
       title {
@@ -661,7 +714,7 @@ class AnilistClient {
     /**
      * @type {import('./al.d.ts').Query<Record<string, {media: import('./al.d.ts').Media[]}>>}
      * @returns {Promise<[string, import('./al.d.ts').Media][]>}
-     * */
+     */
     const res = await this.alRequest(query, requestVariables)
     if (!res?.data || Object.values(res.data).every(({ media }) => !media.length)) return cache.cachedEntry(caches.QUERY_COMPOUND, JSON.stringify(flattenedTitles), true) // if the query failed just return the potential cache... better to have something than nothing.
 
@@ -689,15 +742,16 @@ class AnilistClient {
     return mappedResults ? cache.cacheEntry(caches.QUERY_COMPOUND, JSON.stringify(flattenedTitles), { mappings: true, ...(malClient.userID ? { fillLists: malClient.userLists.value } : {}) }, mappedResults, Date.now() + getRandomInt(60, 90) * 60 * 1_000) : cache.cachedEntry(caches.COMPOUND, JSON.stringify(flattenedTitles), true)
   }
 
-  search(variables = {}) {
+  search(variables = {}, searchCache = true) {
     if (settings.value.adult === 'none') variables.isAdult = false
     if (settings.value.adult !== 'hentai' && (!variables.genre_not || !variables.genre_not.includes('Hentai'))) variables.genre_not = [ ...(variables.genre_not ? variables.genre_not : []), 'Hentai' ]
+    if (searchCache && variables.search?.trim().length >= 3) return this.searchWithCache({ ...variables })
     if (variables.search) variables.search = normalizeASCII(variables.search) // stupid fix because AniList search sucks.
 
     debug(`Searching ${JSON.stringify(variables)}`)
-    const cachedEntry = cache.cachedEntry(caches.QUERY_SEARCH, JSON.stringify(variables), status.value.match(/offline/i))
+    const cachedEntry = !variables.skipCache && cache.cachedEntry(caches.QUERY_SEARCH, JSON.stringify(variables), status.value.match(/offline/i))
     if (cachedEntry) return cachedEntry
-    const query = /* js */` 
+    const query = /* js */`
     query($page: Int, $perPage: Int, $sort: [MediaSort], $search: String, $onList: Boolean, $status: [MediaStatus], $status_not: [MediaStatus], $season: MediaSeason, $year: Int, $genre: [String], $genre_not: [String], $tag: [String], $tag_not: [String], $format: [MediaFormat], $format_not: [MediaFormat], $id_not: [Int], $idMal_not: [Int], $id: [Int], $idMal: [Int], $isAdult: Boolean) {
       Page(page: $page, perPage: $perPage) {
         pageInfo {
@@ -712,7 +766,8 @@ class AnilistClient {
     const request = (async () => {
       try {
         return await this.alRequest(query, variables)
-      } catch {
+      } catch (error) {
+        if (!searchCache) throw error
         return this.fallbackSearch(variables)
       }
     })()
@@ -720,13 +775,87 @@ class AnilistClient {
     return cache.cacheEntry(caches.QUERY_SEARCH, JSON.stringify(variables), { ...variables, ...(malClient.userID ? { fillLists: malClient.userLists.value } : {}) }, request, Date.now() + getRandomInt(75, 100) * 60 * 1_000)
   }
 
+  /**
+   * Supplement title searches with a stable set of fuzzy cache candidates.
+   * AniList applies online filters and metric sorts to the combined IDs.
+   * @param variables
+   */
+  searchWithCache(variables) {
+    if (status.value.match(/offline/i)) return this.fallbackSearch(variables)
+    const { page = 1, perPage = 50, ...filters } = variables
+    const sort = [filters.sort].flat()[0]
+    const start = (page - 1) * perPage
+    const end = start + perPage
+    const key = JSON.stringify([!!Helper.isAniAuth(), Helper.getUser()?.id, settings.value.queryComplexity, perPage, filters])
+    let snapshot = this.searchSnapshots.get(key)
+    if (!snapshot || page === 1) {
+      snapshot = { media: [], candidates: null, nextPage: 1, hasNextPage: true, extras: [], extraIndex: 0, pending: Promise.resolve() }
+      this.searchSnapshots.delete(key)
+      if (this.searchSnapshots.size >= 10) this.searchSnapshots.delete(this.searchSnapshots.keys().next().value)
+      this.searchSnapshots.set(key, snapshot)
+    }
+
+    const request = snapshot.pending.then(async () => {
+      while (snapshot.hasNextPage && snapshot.media.length < end) {
+        const res = await this.search({ ...filters, page: snapshot.nextPage, perPage: 50 }, false)
+        if (!Array.isArray(res?.data?.Page?.media)) throw new Error('AniList search returned no media page')
+        const knownIDs = new Set(snapshot.media.map(media => media.id))
+        for (const media of res.data.Page.media) {
+          if (media && !knownIDs.has(media.id)) { snapshot.media.push(media); knownIDs.add(media.id) }
+        }
+        snapshot.hasNextPage = !!res.data.Page.pageInfo?.hasNextPage
+        snapshot.nextPage++
+        if (!res.data.Page.media.length && snapshot.hasNextPage) throw new Error('AniList search returned an empty intermediate page')
+      }
+      if (!snapshot.candidates) {
+        const cached = await this.fallbackSearch({ ...filters, page: 1, perPage: Math.max(Object.keys(mediaCache.value || {}).length, 1), sort: 'SEARCH_MATCH' })
+        snapshot.candidates = cached.data.Page.media.map(media => media.id)
+      }
+      const primaryIDs = new Set(snapshot.media.map(media => media.id))
+      const extraIDs = snapshot.candidates.filter(id => !primaryIDs.has(id))
+      if (extraIDs.length && sort !== 'OMIT' && sort !== 'SEARCH_MATCH') {
+        const res = await this.search({ ...filters, search: undefined, id: [...primaryIDs, ...extraIDs], page, perPage }, false)
+        if (!Array.isArray(res?.data?.Page?.media)) throw new Error('AniList cache search returned no media page')
+        return {
+          ...res,
+          data: {
+            ...res.data,
+            Page: {
+              ...res.data.Page,
+              pageInfo: { ...res.data.Page.pageInfo, hasNextPage: snapshot.hasNextPage || !!res.data.Page.pageInfo?.hasNextPage }
+            }
+          }
+        }
+      }
+
+      // Preserve AniList order before appending additional, fuzzy-ranked matches.
+      if (!snapshot.hasNextPage) {
+        while (snapshot.extraIndex < extraIDs.length && snapshot.extras.length <= end - snapshot.media.length) {
+          const ids = extraIDs.slice(snapshot.extraIndex, snapshot.extraIndex + 50)
+          const res = await this.search({ ...filters, search: undefined, sort: 'ID', id: ids, page: 1, perPage: 50 }, false)
+          if (!Array.isArray(res?.data?.Page?.media)) throw new Error('AniList cache search returned no media page')
+          const byID = new Map(res.data.Page.media.map(media => [media.id, media]))
+          snapshot.extras.push(...ids.map(id => byID.get(id)).filter(Boolean))
+          snapshot.extraIndex += ids.length
+        }
+      }
+      const media = [...snapshot.media, ...snapshot.extras]
+      return { data: { Page: { pageInfo: { hasNextPage: snapshot.hasNextPage || media.length > end }, media: media.slice(start, end) } } }
+    })
+    snapshot.pending = request.catch(() => {})
+    return request.catch(() => {
+      if (this.searchSnapshots.get(key) === snapshot) this.searchSnapshots.delete(key)
+      return this.fallbackSearch(variables)
+    })
+  }
+
   searchIDSingle(variables) {
     variables.sort = variables.sort || 'OMIT'
     debug(`Searching for ID: ${variables?.id || variables?.idMal}`)
     const cachedEntry = cache.cachedEntry(caches.QUERY_SEARCH_IDS, JSON.stringify(variables), status.value.match(/offline/i))
     if (cachedEntry) return cachedEntry
-    const query = /* js */` 
-    query($id: Int, $idMal: Int) { 
+    const query = /* js */`
+    query($id: Int, $idMal: Int) {
       Media(id: $id, idMal: $idMal, type: ANIME) {
         ${queryObjects}${settings.value.queryComplexity === 'Complex' ? `, ${queryComplexObjects}` : ``}
       }
@@ -749,13 +878,14 @@ class AnilistClient {
     variables.sort = variables.sort || 'OMIT'
     if (settings.value.adult === 'none') variables.isAdult = false
     if (settings.value.adult !== 'hentai' && (!variables.genre_not || !variables.genre_not.includes('Hentai'))) variables.genre_not = [ ...(variables.genre_not ? variables.genre_not : []), 'Hentai' ]
+    if (variables.search?.trim().length >= 3) return this.searchWithCache({ ...variables })
     if (variables.search) variables.search = normalizeASCII(variables.search) // stupid fix because AniList search sucks.
 
     debug(`Searching for IDs ${JSON.stringify(variables)}`)
     const cachedEntry = !variables.skipCache && cache.cachedEntry(caches.QUERY_SEARCH_IDS, JSON.stringify(variables), status.value.match(/offline/i))
     if (cachedEntry) return cachedEntry
-    const query = /* js */` 
-    query($id: [Int], $idMal: [Int], $id_not: [Int], $page: Int, $perPage: Int, $status: [MediaStatus], $onList: Boolean, $sort: [MediaSort], $search: String, $season: MediaSeason, $year: Int, $genre: [String], $genre_not: [String], $tag: [String], $tag_not: [String], $format: [MediaFormat], $isAdult: Boolean) { 
+    const query = /* js */`
+    query($id: [Int], $idMal: [Int], $id_not: [Int], $page: Int, $perPage: Int, $status: [MediaStatus], $onList: Boolean, $sort: [MediaSort], $search: String, $season: MediaSeason, $year: Int, $genre: [String], $genre_not: [String], $tag: [String], $tag_not: [String], $format: [MediaFormat], $isAdult: Boolean) {
       Page(page: $page, perPage: $perPage) {
         pageInfo {
           hasNextPage
@@ -789,7 +919,7 @@ class AnilistClient {
     let currentPage = 1
     let failedRes
     while (true) { // cycle until all paged ids are resolved.
-      const res = await this.searchIDS({ ...variables, page: currentPage, perPage: 50, ...( variables?.id && variables?.id?.length !== 0 ? { id: [...new Set(variables.id)] } : { idMal: [...new Set(variables.idMal)] }) })
+      const res = await this.searchIDS({ ...variables, page: currentPage, perPage: 50, ...(variables?.id && variables?.id?.length !== 0 ? { id: [...new Set(variables.id)] } : { idMal: [...new Set(variables.idMal)] }) })
       if (!res?.data && res?.errors) { failedRes = res }
       if (res?.data?.Page.media) fetchedIDS = fetchedIDS.concat(res?.data?.Page.media)
       if (!res?.data?.Page.pageInfo.hasNextPage) break
@@ -898,10 +1028,6 @@ class AnilistClient {
 
   favourite(variables) {
     debug(`Toggling favourite for ${variables.id}`)
-    const query = /* js */`
-      mutation($id: Int) {
-        ToggleFavourite(animeId: $id) { anime { nodes { id } } } 
-      }`
     const cachedMedia = cache.getMedia(variables.id)
     if (cachedMedia) cachedMedia.isFavourite = variables.isFavourite
     if (status.value.match(/offline/i) && settings.value.offlineSync) {
@@ -909,8 +1035,18 @@ class AnilistClient {
       this.mutationQueue.enqueue('favourite', variables.id, variables, null, null, false)
       return variables.isFavourite
     }
-    this.alRequest(query, variables).then(() => this.mutationQueue.enqueue('favourite', variables.id, variables, variables.isFavourite))
+    this.#toggleFavourite(variables).catch(error => debug('Failed to toggle favourite:', error))
     return variables.isFavourite
+  }
+
+  async #toggleFavourite(variables) {
+    const query = /* js */`
+      mutation($id: Int) {
+        ToggleFavourite(animeId: $id) { anime { nodes { id } } }
+      }`
+    const res = await this.alRequest(query, variables)
+    if (res?.errors?.length || !res?.data?.ToggleFavourite) throw new Error('AniList favourite update failed')
+    this.mutationQueue.enqueue('favourite', variables.id, variables, variables.isFavourite)
   }
 
   /** @param {import('./al.d.ts').Media} media */
@@ -934,21 +1070,35 @@ class AnilistClient {
    * Re-applies executed mutations to local cache and executes offline mutations against the API, both validated against the current resolved list.
    */
   async #flushMutationQueue() {
-    if (this.mutationQueue.isFetchingList) return
-    const mediaList = (await this.userLists.value)?.data?.MediaListCollection
-    await this.mutationQueue.flush(
-      mediaList,
-      async (mutation) => {
-        if (mutation.type === 'entry') await this.updateListEntry(mutation.mediaId, mutation.result)
-        else if (mutation.type === 'delete') await this.deleteListEntry(mutation.mediaId)
-        else if (mutation.type === 'favourite') this.favourite({ id: mutation.mediaId })
-      },
-      async (mutation) => {
-        if (mutation.type === 'entry') await this.entry(mutation.variables)
-        else if (mutation.type === 'delete') await this.delete(mutation.variables)
-        else if (mutation.type === 'favourite') this.favourite(mutation.variables)
-      }
-    )
+    if (this.mutationQueue.isFetchingList || this.#isFlushingMutations) return
+    this.#isFlushingMutations = true
+    try {
+      const mediaList = (await this.userLists.value)?.data?.MediaListCollection
+      await this.mutationQueue.flush(
+        mediaList,
+        async (mutation) => {
+          if (mutation.type === 'entry') await this.updateListEntry(mutation.mediaId, mutation.result)
+          else if (mutation.type === 'delete') await this.deleteListEntry(mutation.mediaId)
+          else if (mutation.type === 'favourite') {
+            const media = cache.getMedia(mutation.mediaId)
+            if (media?.id) cache.updateMedia([{ ...media, isFavourite: mutation.result }])
+          }
+        },
+        async (mutation) => {
+          if (status.value.match(/offline/i)) throw new Error('Cannot replay AniList mutations while offline')
+          if (mutation.type === 'entry') {
+            const res = await this.entry(mutation.variables)
+            if (!res?.data?.SaveMediaListEntry) throw new Error('AniList entry update failed')
+            return res.data.SaveMediaListEntry
+          } else if (mutation.type === 'delete') {
+            const res = await this.delete(mutation.variables)
+            if (res?.data?.DeleteMediaListEntry?.deleted !== true) throw new Error('AniList entry deletion failed')
+          } else if (mutation.type === 'favourite') await this.#toggleFavourite(mutation.variables)
+        }
+      )
+    } finally {
+      this.#isFlushingMutations = false
+    }
   }
 
   /**
@@ -1010,8 +1160,7 @@ class AnilistClient {
   /**
    * Returns a Promise for a given AniList media ID.
    * Deduplicates multiple requests for the same ID, returning the same promise.
-   *
-   * @param {number} id - AniList media ID
+   * @param {number} id AniList media ID
    * @returns {Promise<import('./al.d.ts').Media | null>}
    */
   requestMediaID(id) {
@@ -1027,57 +1176,144 @@ class AnilistClient {
   }
 
   /**
-   * Fallback search using mediaCache if the network/API fails.
-   * @param {object} variables - The query variables.
-   * @param {boolean} [single=false] - Whether to return a single media object or a paged result.
+   * Filter and fuzzy-match cached media for search candidates or offline results.
+   * @param {object} variables The query variables.
+   * @param {boolean} [single=false] Whether to return a single media object or a paged result.
    * @returns {Promise<import('./al.d.ts').Media | { data: { Page: { pageInfo: { hasNextPage: boolean }, media: import('./al.d.ts').Media[] } } }>}
    */
   fallbackSearch(variables, single = false) {
-    debug('AniList search failed, falling back to searching the mediaCache...')
-    let media = Object.values(mediaCache.value || {})
+    debug('Searching the mediaCache...')
+    let media = Object.values(mediaCache.value || {}).filter(Boolean)
+    const filters = Object.fromEntries(['id', 'idMal', 'id_not', 'idMal_not', 'status', 'status_not', 'format', 'format_not', 'genre', 'genre_not', 'tag', 'tag_not'].map(key => [key, [variables[key] ?? []].flat()]))
+    for (const key of ['genre', 'genre_not', 'tag', 'tag_not']) filters[key] = filters[key].map(value => String(value).trim().toLowerCase())
+    for (const key of ['id', 'idMal', 'id_not', 'idMal_not']) filters[key] = new Set(filters[key])
+    const scores = new Map()
 
     if (single) {
       media = media.filter(_media => !(variables.id && _media.id !== variables.id) && !(variables.idMal && _media.idMal !== variables.idMal))
     } else {
       media = media.filter(_media => {
-        if (variables.id && !variables.id.includes(_media.id)) return false
-        if (variables.idMal && !variables.idMal.includes(_media.idMal)) return false
-        if (variables.id_not?.includes(_media.id)) return false
-        if (variables.idMal_not?.includes(_media.idMal)) return false
+        if (variables.id != null && !filters.id.has(_media.id)) return false
+        if (variables.idMal != null && !filters.idMal.has(_media.idMal)) return false
+        if (filters.id_not.has(_media.id)) return false
+        if (filters.idMal_not.has(_media.idMal)) return false
 
         if ((variables.onList === true && !_media.mediaListEntry) || (variables.onList === false && _media.mediaListEntry)) return false
-        if (variables.isAdult === false && _media.isAdult) return false
+        if (variables.isAdult != null && _media.isAdult !== variables.isAdult) return false
 
-        if (variables.status && !variables.status.includes(_media.status)) return false
-        if (variables.status_not && variables.status_not.includes(_media.status)) return false
-
+        if (filters.status.length && !filters.status.includes(_media.status)) return false
+        if (filters.status_not.includes(_media.status)) return false
         if (variables.season && _media.season !== variables.season) return false
-        if (variables.year && _media.seasonYear !== variables.year) return false
+        if (variables.year && Number(_media.seasonYear) !== Number(variables.year)) return false
+        if (filters.format.length && !filters.format.includes(_media.format)) return false
+        if (filters.format_not.includes(_media.format) || _media.format === 'MUSIC') return false
 
-        if (variables.format && !variables.format.includes(_media.format)) return false
-        if (variables.format_not && variables.format_not.includes(_media.format)) return false
-        if (_media.format === 'MUSIC') return false
-
-        if (variables.genre && !variables.genre.some(genre => _media.genres?.includes(genre))) return false
-        if (variables.genre_not && variables.genre_not.some(genre => _media.genres?.includes(genre))) return false
-
-        if (variables.tag && !variables.tag.some(tag => _media.tags?.some(mediaTag => mediaTag.name === tag))) return false
-        if (variables.tag_not && variables.tag_not.some(tag => _media.tags?.some(mediaTag => mediaTag.name === tag))) return false
-
-        if (variables.search) {
-          const searchText = variables.search.toLowerCase()
-          const titles = [_media.title?.romaji, _media.title?.english, _media.title?.native, _media.title?.userPreferred, ...(_media.synonyms || [])].filter(Boolean).map(t => t.toLowerCase())
-          if (!titles.some(t => t.includes(searchText))) return false
+        if (filters.genre.length || filters.genre_not.length) {
+          const genres = new Set((_media.genres || []).map(genre => genre.trim().toLowerCase()))
+          if (!filters.genre.every(genre => genres.has(genre))) return false
+          if (filters.genre_not.some(genre => genres.has(genre))) return false
+        }
+        if (filters.tag.length || filters.tag_not.length) {
+          const tags = new Set((_media.tags || []).filter(tag => tag.rank >= 18).map(tag => tag.name.trim().toLowerCase()))
+          if (!filters.tag.every(tag => tags.has(tag))) return false
+          if (filters.tag_not.some(tag => tags.has(tag))) return false
         }
         return true
       })
+
+      const search = variables.search?.trim()
+      if (search) {
+        const normalize = text => text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f'\u2018\u2019]/g, '').replace(/[\u2010-\u2015]/g, '-').replace(/\band\b/g, '&')
+        // Avoid Unicode-property regex requirements on older Android WebViews.
+        const tokenize = text => text.split(/[\s\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E]+/).filter(Boolean)
+        this.titleSearchCache ||= new WeakMap()
+        const candidates = media.map(media => {
+          const titles = [...Object.values(media.title || {}), ...(media.synonyms || [])].filter(title => typeof title === 'string')
+          let cached = this.titleSearchCache.get(media)
+          if (!cached || titles.length !== cached.titles.length || titles.some((title, index) => title !== cached.titles[index])) {
+            const normalized = [...new Set(titles.map(normalize))]
+            // Ignore spacing and letter-joining hyphens within each title, keeping aliases separate.
+            cached = { titles, text: normalized.join('\n'), compact: normalized.map(title => title.replace(/\s+/g, '').replace(/([a-z])-+(?=[a-z])/g, '$1')).join('\n'), words: null }
+            this.titleSearchCache.set(media, cached)
+          }
+          return { media, cached }
+        })
+        const terms = tokenize(normalize(search))
+        const findExact = terms => terms.length ? candidates.filter(({ cached }) => terms.every(term => cached.compact.includes(term))) : []
+        const wordMatches = terms.map(() => new Map())
+        // Test short, exact-only terms first, calculate each possible word edit once.
+        const order = terms.map((_, index) => index).sort((a, b) => Math.min(terms[a].length, 5) - Math.min(terms[b].length, 5))
+        let matches = terms.length ? candidates.filter(({ cached }) => order.every(index => {
+          const term = terms[index]
+          if (cached.compact.includes(term)) return true
+          const limit = Math.floor(term.length / 5)
+          if (!limit || !/^[a-z]+$/.test(term)) return false
+          cached.words ||= [...new Set(tokenize(cached.text))]
+          return cached.words.some(word => {
+            if (word.length < term.length - limit) return false
+            let match = wordMatches[index].get(word)
+            if (match === undefined) {
+              match = lavenshtein(term, word.slice(0, term.length)) <= limit || (word.length > term.length && word.length <= term.length + limit && lavenshtein(term, word) <= limit)
+              wordMatches[index].set(word, match)
+            }
+            return match
+          })
+        })) : []
+        // Keep the existing contextual corrections and ambiguity rejection.
+        if (!matches.length) {
+          const wordPattern = /^[a-z]{4,9}$/i
+          if (terms.some(term => wordPattern.test(term) && (term.length > 4 || terms.length > 1))) {
+            const variants = new Set()
+            for (let index = 0; index < terms.length; index++) {
+              const term = terms[index]
+              if (!wordPattern.test(term)) continue
+              const others = terms.filter((_, position) => position !== index)
+              const context = findExact(others)
+              if (others.length && !context.length) continue
+              if (term.length === 4) {
+                if (!context.length) continue
+                const words = new Set(context.flatMap(({ cached }) => {
+                  cached.words ||= [...new Set(tokenize(cached.text))]
+                  return cached.words
+                }))
+                for (const word of words) {
+                  if (/^[a-z]{3,5}$/.test(word) && lavenshtein(term, word) === 1) {
+                    variants.add(terms.map((token, position) => position === index ? word : token).join(' '))
+                  }
+                }
+                continue
+              }
+              for (let letter = 0; letter < term.length - 1; letter++) {
+                if (term[letter] === term[letter + 1]) continue
+                const swapped = term.slice(0, letter) + term[letter + 1] + term[letter] + term.slice(letter + 2)
+                variants.add(terms.map((word, position) => position === index ? swapped : word).join(' '))
+              }
+            }
+            for (const variant of variants) {
+              const corrected = findExact(tokenize(variant))
+              if (!corrected.length) continue
+              if (matches.length) {
+                matches = []
+                break
+              }
+              matches = corrected
+            }
+          }
+        }
+        media = matches.map(({ media }) => {
+          scores.set(media.id, getDistanceFromTitle(media, search).lavenshtein)
+          return media
+        })
+      }
     }
 
-    if (variables.sort) {
+    if (variables.sort || !single) {
       media.sort((a, b) => {
-        switch (variables.sort) {
+        switch ([variables.sort].flat()[0] || 'TRENDING_DESC') {
+          case 'SEARCH_MATCH':
+            return (scores.get(a.id) ?? 1) - (scores.get(b.id) ?? 1)
           case 'TRENDING_DESC':
-            return (b.popularity || 0) - (a.popularity || 0)
+            return (b.trending || 0) - (a.trending || 0)
           case 'POPULARITY_DESC':
             return (b.popularity ?? b.stats?.scoreDistribution?.reduce((acc, score) => acc + (score.amount || 0), 0) ?? 0) - (a.popularity ?? a.stats?.scoreDistribution?.reduce((acc, score) => acc + (score.amount || 0), 0) ?? 0)
           case 'TITLE_ROMAJI':
@@ -1092,7 +1328,7 @@ class AnilistClient {
             return (b.mediaListEntry?.startedAt ? (b.mediaListEntry.startedAt.year || 0) * 10_000 + (b.mediaListEntry.startedAt.month || 0) * 100 + (b.mediaListEntry.startedAt.day || 0) : 0) - (a.mediaListEntry?.startedAt ? (a.mediaListEntry.startedAt.year || 0) * 10_000 + (a.mediaListEntry.startedAt.month || 0) * 100 + (a.mediaListEntry.startedAt.day || 0) : 0)
           case 'UPDATED_TIME_DESC':
             return (b.mediaListEntry?.updatedAt || 0) - (a.mediaListEntry?.updatedAt || 0)
-          case 'PROGRESS_DESC':
+          case 'PROGRESS_DESC': {
             const getSortValue = (media) => {
               const progress = media?.mediaListEntry?.progress ?? 0
               const totalEpisodes = media?.episodes ?? getMediaMaxEp(media) ?? 0
@@ -1102,6 +1338,7 @@ class AnilistClient {
               return distance <= 0 ? -Infinity : distance
             }
             return getSortValue(a) - getSortValue(b)
+          }
           case 'USER_SCORE_DESC': // doesn't exist, AniList uses SCORE_DESC for both MediaSort and MediaListSort.
             return (b.mediaListEntry?.score || 0) - (a.mediaListEntry?.score || 0)
           default:

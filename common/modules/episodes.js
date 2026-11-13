@@ -23,7 +23,7 @@ class Episodes {
 
     constructor() {
         this.limiter.on('failed', async (error) => {
-            let info = (await error.json()) || error
+            const info = (await error.json()) || error
             if (await isOffline(info)) throw new Error('Failed making episode request, network is offline... not retrying.')
             if (info.status === 500) return 1
 
@@ -35,7 +35,7 @@ class Episodes {
 
     async getEpisodeData(idMal) {
         if (!idMal) return []
-        let page = 1
+        const page = 1
         const res = await this.requestEpisodes(idMal, page)
         if (res && res.pagination?.has_next_page && res.pagination?.last_visible_page) {
             const lastRes = await this.requestEpisodes(idMal, res.pagination.last_visible_page * 100)
@@ -104,7 +104,7 @@ class Episodes {
             debug(`Fetching Episode ${episode} for ${id} with Page ${page}`)
             let res = {}
             try {
-                res = await fetch(`https://api.jikan.moe/v4/anime/${id}${!root ? `/episodes?page=${page}` : ``}`)
+                res = await fetch(`https://api.tenrai.org/v1/anime/${id}${!root ? `/episodes?page=${page}` : ``}`)
                 // res = await fetch(jikan ? `https://api.jikan.moe/v4/anime/${id}${!root ? `/episodes?page=${page}` : ``}` : `https://kitsu.app/api/edge/anime/${id}/episodes`)
             } catch (e) {
                 if (!res || res.status !== 404) throw e

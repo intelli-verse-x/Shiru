@@ -10,8 +10,8 @@ on:
         type: boolean
 
 env:
-  NODE_VERSION: '24.18.1'
-  PNPM_VERSION: '10.34.1'
+  NODE_VERSION: '24.22.1'
+  PNPM_VERSION: '12.17.0'
 
 jobs:
   prepare-release:
@@ -50,7 +50,7 @@ jobs:
 
   release-windows:
     needs: prepare-release
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     steps:
       - name: Check out Git repository
@@ -77,7 +77,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd electron
-          npm run publish
+          pnpm run publish
 
   release-linux:
     needs: prepare-release
@@ -115,7 +115,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd electron
-          npm run publish
+          pnpm run publish
 
   release-macos:
     needs: prepare-release
@@ -136,7 +136,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'pnpm'
 
-      - name: Install Setuptools for Python (macOS only)
+      - name: Install Setuptools for Python
         run: pip3 install setuptools --break-system-packages
 
       - name: Install dependencies
@@ -149,7 +149,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd electron
-          npm run publish
+          pnpm run publish
 
   release-android:
     needs: prepare-release
@@ -215,7 +215,7 @@ jobs:
 
       - name: Sign Android APK
         id: sign_app
-        uses: RockinChaos/sign-android@v1.1.0
+        uses: RockinChaos/sign-android@v1.2.0
         with:
           releaseDir: capacitor/android/app/build/outputs/apk/release
           signingKey: "${{ secrets.SIGNING_KEY }}"
@@ -226,13 +226,6 @@ jobs:
           appVersion: ${{ env.APP_VERSION }}
           appPrefix: android
 
-      - name: Split Signed Files
-        uses: jungwinter/split@v2
-        id: signed_files
-        with:
-          msg: ${{ steps.sign_app.outputs.signedFiles }}
-          separator: ':'
-
       - name: Generate latest-android.yml
         run: |
           echo "version: ${{ env.APP_VERSION }}" | sed 's/^version: v/version: /' > latest-android.yml
@@ -240,12 +233,12 @@ jobs:
       - name: Publish Android APK
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNED_FILES: ${{ steps.sign_app.outputs.signedFilesList }}
         run: |
-          for f in "${{ steps.signed_files.outputs._0 }}" "${{ steps.signed_files.outputs._1 }}" "${{ steps.signed_files.outputs._2 }}" "${{ steps.signed_files.outputs._3 }}"; do
-            if [ -n "$f" ]; then
-              echo "uploading $(basename $f)"
-              gh release upload --clobber "$APP_VERSION" "../$f"
-            fi
+          mapfile -t files <<< "$SIGNED_FILES"
+          for f in "${files[@]}"; do
+            echo "uploading $(basename "$f")"
+            gh release upload --clobber "$APP_VERSION" "$f"
           done
           echo "uploading latest-android.yml"
           gh release upload --clobber "$APP_VERSION" latest-android.yml

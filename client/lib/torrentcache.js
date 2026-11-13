@@ -3,11 +3,45 @@ import { mkdir, readFile, writeFile, unlink, access, readdir } from 'fs/promises
 import parseTorrent from 'parse-torrent'
 import bencode from 'bencode'
 
+/** Converts custom torrent fields between expected values and bencode-safe values. */
+const codecs = {
+  media: {
+    encode(value) {
+      const encodeValue = value => {
+        if (typeof value === 'boolean') return Number(value)
+        if (typeof value === 'number' && !Number.isInteger(value)) return String(value)
+        if (Array.isArray(value)) return value.map(encodeValue)
+        if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, value]) => [key, encodeValue(value)]))
+        return value
+      }
+      return encodeValue(value)
+    },
+    decode(value) {
+      const decodeValue = (value, key = '') => {
+        if (ArrayBuffer.isView(value)) {
+          const text = Buffer.from(value).toString()
+          return ['episode', 'season', 'first', 'last'].includes(key) && Number.isFinite(Number(text)) && !Number.isInteger(Number(text)) ? Number(text) : text
+        }
+        if (Array.isArray(value)) return value.map(item => decodeValue(item))
+        if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, value]) => [key, decodeValue(value, key)]))
+        return value
+      }
+      const media = decodeValue(value)
+      for (const file of [media.default, ...Object.values(media.files || {})]) {
+        if (!file) continue
+        file.failed = !!file.failed
+        file.locked = !!file.locked
+      }
+      return media
+    }
+  }
+}
+
 export default class Cache {
 
   /**
    * Creates a new TorrentStore instance with a cache folder inside the given torrent path.
-   * @param {string} torrentPath - Base path where the cache folder will be created, this SHOULD be where WebTorrent is storing its files!
+   * @param {string} torrentPath Base path where the cache folder will be created, this SHOULD be where WebTorrent is storing its files!
    */
   constructor(torrentPath) {
     const targetPath = join(torrentPath, 'shiru-cache')
@@ -16,7 +50,7 @@ export default class Cache {
 
   /**
    * Reads and decodes a stored torrent entry by key.
-   * @param {string} key - The key (filename) to read.
+   * @param {string} key The key (filename) to read.
    * @returns {Promise<Object|null>} Decoded stored object or null if not found/error.
    */
   async get(key) {
@@ -27,7 +61,7 @@ export default class Cache {
       const parsed = await parseTorrent(data)
       const customFields = {}
       for (const [key, value] of Object.entries(bencode.decode(data))) {
-        if (!(key in parsed)) customFields[key] = value
+        if (!(key in parsed)) customFields[key] = codecs[key]?.decode ? codecs[key].decode(value) : value
       }
       const { announce, urlList, ...safeParsed } = { ...parsed, ...customFields }
       return safeParsed
@@ -38,12 +72,13 @@ export default class Cache {
 
   /**
    * Encodes and writes a value to storage by key.
-   * @param {string} key - The key (filename) to write.
-   * @param {Object} value - The value to encode and store.
-   * @param {boolean} bencoded - Whether the data should be bencoded or not, bencode is used by default.
+   * @param {string} key The key (filename) to write.
+   * @param {Object} value The value to encode and store.
+   * @param {boolean} bencoded Whether the data should be bencoded or not, bencode is used by default.
    * @returns {Promise<void>}
    */
   async set(key, value, bencoded = true) {
+    if (bencoded) value = Object.fromEntries(Object.entries(value).map(([key, value]) => [key, codecs[key]?.encode ? codecs[key].encode(value) : value]))
     const buffer = bencoded ? bencode.encode(value) : Buffer.from(JSON.stringify(value))
     if (!buffer.length) return
     const path = join(await this.cacheFolder, key)
@@ -62,8 +97,8 @@ export default class Cache {
 
   /**
    * Deletes a stored entry by key.
-   * @param {string} key - The key (filename) to delete.
-   * @param {string|Promise<string>} [path] - Optional path to override the default cache folder, typically for the WebTorrent folder.
+   * @param {string} key The key (filename) to delete.
+   * @param {string|Promise<string>} [path] Optional path to override the default cache folder, typically for the WebTorrent folder.
    * @returns {Promise<void|null>}
    */
   async delete(key, path = null) {
@@ -76,8 +111,8 @@ export default class Cache {
 
   /**
    * Checks if a stored entry exists by key.
-   * @param {string} key - The key (filename) to check.
-   * @param {string|Promise<string>} [path] - Optional path to override the default cache folder, typically for the WebTorrent folder.
+   * @param {string} key The key (filename) to check.
+   * @param {string|Promise<string>} [path] Optional path to override the default cache folder, typically for the WebTorrent folder.
    * @returns {Promise<boolean>} True if exists, false otherwise.
    */
   async exists(key, path = null) {

@@ -63,7 +63,7 @@ export default class SectionsManager {
             const userAnimeIds = Array.from(new Set(Helper.isAniAuth() ? targetLists.filter(({ status }) => statusFilter.includes(status)).flatMap(list => list.entries.map(({ media }) => hasHideSubs ? media.idMal : media.id)) : targetLists.filter(({ node }) => statusFilter.includes(Helper.statusMap(node.my_list_status.status))).map(({ node }) => node.id))).filter(Boolean)
             // anilist queries do not support mix and match, you have to use the same id includes as excludes, id_not_in cannot be used with idMal_in.
             if (search.hideMyAnime) animeFilter = userAnimeIds?.length ? (Helper.isAniAuth() ? { [hasHideSubs ? 'idMal_not' : 'id_not']: userAnimeIds.filter(Boolean) } : { idMal_not: userAnimeIds }) : {}
-            else if (search.showMyAnime) animeFilter = userAnimeIds?.length ? { id: userAnimeIds.filter(Boolean) } : {}
+            else if (search.showMyAnime) animeFilter = { [Helper.isAniAuth() && !hasHideSubs ? 'id' : 'idMal']: userAnimeIds.filter(id => !hasHideSubs || dubLists?.dubbed?.includes(id)) }
             return anilistClient.search({ page, perPage, ...hideSubs, ...animeFilter, ...SectionsManager.sanitiseObject(search) })
           })
         }
@@ -74,7 +74,7 @@ export default class SectionsManager {
   }
 
   static wrapResponse (res, length, type, background = false) {
-    if (!background) res.then(res => hasNextPage.value = res?.data?.Page?.pageInfo?.hasNextPage)
+    if (!background) res.then(res => (hasNextPage.value = res?.data?.Page?.pageInfo?.hasNextPage))
     return Array.from({ length }, (_, i) => ({ type, data: SectionsManager.fromPending(res, i) }))
   }
 
@@ -117,7 +117,7 @@ function createSections () {
   const createSection = (section, variables = {}, staticSort) => ({ ...section, ...(section.sort && staticSort ? { sort: 'N/A' } : {}), variables: { ...variables, sort: settings.value.homeSections.find(([t]) => !staticSort && t === section.title)?.[1] ?? section.sort, ...(Array.isArray(sectionFormat(section.title)) && sectionFormat(section.title).length > 0 ? { format : sectionFormat(section.title) } : {}) } })
   return [
     // RSS feeds
-    ...settings.value.rssFeedsNew.filter(([url]) => url).map(([title, url]) => {
+    ...settings.value.rssFeedsNew.filter(([title, url]) => title && url?.trim()).map(([title, url]) => {
       const section = {
         title,
         sort: 'N/A',
@@ -162,7 +162,7 @@ function createSections () {
         const res = Helper.userLists(variables).then(res => {
           if (!res?.data && res?.errors) throw res.errors[0]
           const mediaList = (res.data.MediaListCollection?.lists || []).find(({ status }) => status === 'COMPLETED')?.entries
-          const excludeIds = (res.data.MediaListCollection?.lists || []).reduce((filtered, { status, entries }) => { return (['CURRENT', 'REPEATING', 'COMPLETED', 'DROPPED', 'PAUSED'].includes(status)) ? filtered.concat(entries) : filtered}, []).map(({ media }) => media.id).filter(Boolean) || []
+          const excludeIds = (res.data.MediaListCollection?.lists || []).reduce((filtered, { status, entries }) => { return (['CURRENT', 'REPEATING', 'COMPLETED', 'DROPPED', 'PAUSED'].includes(status)) ? filtered.concat(entries) : filtered }, []).map(({ media }) => media.id).filter(Boolean) || []
           if (!mediaList) return {}
           const ids = mediaList.flatMap(({ media }) => media.relations.edges.filter(edge => edge.relationType === 'SEQUEL')).map(({ node }) => node.id).filter(Boolean)
           if (!ids.length) return {}
@@ -177,7 +177,7 @@ function createSections () {
         const res = Helper.userLists(variables).then(res => {
           if (!res?.data && res?.errors) throw res.errors[0]
           const mediaList = (res.data.MediaListCollection?.lists || []).find(({ status }) => status === 'COMPLETED')?.entries
-          const excludeIds = (res.data.MediaListCollection?.lists || []).reduce((filtered, { status, entries }) => { return (['CURRENT', 'REPEATING', 'COMPLETED', 'DROPPED', 'PAUSED'].includes(status)) ? filtered.concat(entries) : filtered}, []).map(({ media }) => media.id).filter(Boolean) || []
+          const excludeIds = (res.data.MediaListCollection?.lists || []).reduce((filtered, { status, entries }) => { return (['CURRENT', 'REPEATING', 'COMPLETED', 'DROPPED', 'PAUSED'].includes(status)) ? filtered.concat(entries) : filtered }, []).map(({ media }) => media.id).filter(Boolean) || []
           if (!mediaList) return {}
           const ids = mediaList.flatMap(({ media }) => media.relations.edges.filter(edge => !['SEQUEL', 'CHARACTER', 'OTHER'].includes(edge.relationType))).map(({ node }) => node.id).filter(Boolean)
           if (!ids.length) return {}
@@ -192,12 +192,22 @@ function createSections () {
           if (!res?.data && res?.errors) throw res.errors[0]
           let mediaList = Helper.isAniAuth() ? (res.data.MediaListCollection?.lists || []).reduce((filtered, { status, entries }) => (status === 'CURRENT' || status === 'REPEATING') ? filtered.concat(entries) : filtered, []) : (res.data.MediaList || []).filter(({ node }) => (node.my_list_status.status === Helper.statusMap('CURRENT') || node.my_list_status.is_rewatching))
           if (!mediaList) return {}
-          return animeSchedule.dubAiringLists.value.then(airing => {
+          return Promise.all([animeSchedule.dubAiringLists.value, animeSchedule.dubAiredLists.value, malDubs.dubLists.value]).then(([airing, dubAired, dubLists]) => {
             if (settings.value.preferDubs) {
               const ids = []
+              const twoWeeksAgo = Date.now() - (14 * 24 * 60 * 60 * 1_000)
               mediaList.forEach(watchMedia => {
                 const media = watchMedia?.media || watchMedia?.node
+                const isDubbed = dubLists?.dubbed?.includes(media?.idMal || media?.id)
+                const isPartialDub = dubLists?.incomplete?.includes(media?.idMal || media?.id)
                 const matchingAiring = airing?.find(item => (watchMedia?.media ? item?.media?.media?.id : item?.media?.media?.idMal) === media?.id)
+                const airedDubs = (dubAired || []).filter(item => item?.id === media?.id || item?.idMal === media?.id)
+                const latestDub = airedDubs.sort((a, b) => b?.episode?.aired - a?.episode?.aired)[0]
+                const progress = media?.mediaListEntry?.progress ?? media?.my_list_status?.num_episodes_watched ?? 0
+                if (isDubbed && (latestDub && progress === (latestDub.episode.aired + (airedDubs.some(item => item?.episode?.aired === 0) ? 1 : 0))) && ((media?.status === 'RELEASING' || media?.status === 'currently_airing') || (!isPartialDub && new Date(latestDub.episode.airedAt).getTime() >= twoWeeksAgo))) {
+                  ids.push(media?.id)
+                  return
+                }
                 if (matchingAiring && (media?.mediaListEntry || media?.my_list_status)) {
                   const now = new Date()
                   const episodes = matchingAiring?.media?.media?.airingSchedule?.nodes
@@ -211,19 +221,24 @@ function createSections () {
               })
               mediaList = mediaList.filter(media => !ids.includes(media?.media?.id || media?.node?.id))
             }
-            return animeSchedule.subAiringLists.value.then(airing => {
+            return Promise.all([animeSchedule.subAiringLists.value, animeSchedule.subAiredLists.value, animeSchedule.hentaiAiredLists.value]).then(([airing, subAired, hentaiAired]) => {
               if (Helper.isMalAuth()) {
                 const ids = []
                 mediaList.forEach(watchMedia => {
                   const media = watchMedia?.node
                   const matchingAiring = airing?.find(item => item?.idMal === media?.id)
+                  const airedSubs = (subAired || []).filter(item => item?.idMal === media?.id)
+                  const airedEpisodes = airedSubs.length ? airedSubs : (hentaiAired || []).filter(item => item?.idMal === media?.id)
                   if (matchingAiring && media?.my_list_status) {
                     const now = Date.now() / 1000
                     const episodes = matchingAiring?.airingSchedule?.nodes || []
                     const closest = episodes.sort((a, b) => Math.abs(a.airingAt - now) - Math.abs(b.airingAt - now))[0]
-                    const highestEpisode = Math.max(...episodes.filter(ep => ep.airingAt === closest?.airingAt)?.map(ep => ep.episode))
-                    const episodeNumber = closest ? closest.airingAt > now ? highestEpisode - 1 : highestEpisode : null
+                    const closestEpisodes = episodes.filter(ep => ep.airingAt === closest?.airingAt).map(ep => ep.episode)
+                    const episodeNumber = closest ? closest.airingAt > now ? Math.min(...closestEpisodes) - 1 : Math.max(...closestEpisodes) : null
                     if (media?.my_list_status?.num_episodes_watched >= (episodeNumber || media?.num_episodes)) ids.push(media?.id)
+                  } else if (media?.status === 'currently_airing' && airedEpisodes.length) {
+                    const latestEpisode = Math.max(...airedEpisodes.map(item => item?.episode?.aired ?? 0))
+                    if (media?.my_list_status?.num_episodes_watched === latestEpisode) ids.push(media?.id)
                   }
                 })
                 mediaList = mediaList.filter(media => !ids.includes(media?.media?.id || media?.node?.id))
@@ -385,7 +400,7 @@ export async function updateRSS() {
   for (const section of manager.sections) {
     if (section.isRSS && !section.isSchedule) {
       const url = settings.value.rssFeedsNew.find(([feedTitle]) => feedTitle === section.title)?.[1]
-      if (url) {
+      if (url?.trim()) {
         const loaded = RSSManager.getMediaForRSS(1, 12, url, false, true, true)
         if (!section.preview.value || !equal(await resolveData(loaded), await resolveData(section.preview.value))) section.preview.value = loaded
       }

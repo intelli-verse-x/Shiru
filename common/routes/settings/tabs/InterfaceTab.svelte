@@ -11,6 +11,48 @@
   import Helper from '@/modules/providers/helper.js'
   export let settings
   const listStatus = [['Watching', 'CURRENT'], ['Planning', 'PLANNING'], ['Paused', 'PAUSED'], ['Completed', 'COMPLETED'], ['Dropped', 'DROPPED'], ['Rewatching', 'REPEATING'], ['Not on List', 'NOTONLIST']]
+
+  function addSpoilerStatus() {
+    const status = listStatus.find(option => option[1] !== 'COMPLETED' && !settings.spoilerStatus.includes(option[1]))?.[1]
+    if (status) settings.spoilerStatus = [...settings.spoilerStatus, status]
+  }
+
+  function addNotifyStatus(source) {
+    const notifyKey = `${source}Notify`
+    const status = listStatus.find(option => !settings[notifyKey].includes(option[1]))?.[1]
+    if (status) updateNotifyStatus(source, settings[notifyKey].length, status)
+  }
+
+  function ensureNotifyFeeds(adult = settings.adult) {
+    for (const source of ['releases', 'rss']) {
+      const notifyKey = `${source}Notify`
+      const disabledKey = `${notifyKey}Disabled`
+      const types = ['Sub', 'Dub', ...(source === 'releases' && adult === 'hentai' ? ['Hentai'] : [])]
+      for (const status of settings[notifyKey] || []) {
+        const disabled = settings[disabledKey]?.[status] || []
+        if (types.every(type => disabled.includes(type))) {
+          settings[disabledKey] = { ...settings[disabledKey], [status]: disabled.filter(type => type !== 'Sub') }
+        }
+      }
+    }
+  }
+
+  function updateNotifyStatus(source, index, status = undefined) {
+    const notifyKey = `${source}Notify`
+    const disabledKey = `${notifyKey}Disabled`
+    const disabled = { ...settings[disabledKey] }
+    const previousStatus = settings[notifyKey][index]
+    const feeds = disabled[previousStatus]
+    delete disabled[previousStatus]
+    if (status === undefined) settings[notifyKey].splice(index, 1)
+    else {
+      settings[notifyKey][index] = status
+      if (feeds?.length) disabled[status] = feeds
+      else delete disabled[status]
+    }
+    settings[notifyKey] = settings[notifyKey]
+    settings[disabledKey] = disabled
+  }
 </script>
 
 <h4 class='mb-10 font-weight-bold'>Interface Settings</h4>
@@ -61,27 +103,27 @@
     <option value='full'>Full</option>
   </select>
 </SettingCard>
-{#if SUPPORTS.isAndroid && settings.cards === 'small'}
-  <SettingCard title='Card Preview' description='If a detailed preview card should be shown when tapping or hovering over the small card.'>
+{#if SUPPORTS.isAndroid}
+  <SettingCard title='Card Preview' description='If a detailed preview card should be shown when tapping or hovering over small cards or episode cards.'>
     <div class='custom-switch fit-content'>
       <input type='checkbox' id='card-preview' bind:checked={settings.cardPreview} />
       <label for='card-preview'>{settings.cardPreview ? 'On' : 'Off'}</label>
     </div>
   </SettingCard>
 {/if}
-<SettingCard title='Card Audio' description={'If the sub, dub, partial dub, and age rating icons should be shown on the cards, the corresponding episode number will be shown when possible. Additionally a label will be shown on the preview cards, anime view, episode cards, and the home banner of the highest possible audio available, either dub, partial dub, or sub. Note these will not be visible when viewing the schedule page. '}>
+<SettingCard title='Card Audio' description='If the sub, dub, partial dub, and age rating icons should be shown on the cards, the corresponding episode number will be shown when possible. Additionally a label will be shown on the preview cards, anime view, episode cards, and the home banner of the highest possible audio available, either dub, partial dub, or sub. Note these will not be visible when viewing the schedule page.'>
   <div class='custom-switch fit-content'>
     <input type='checkbox' id='card-audio' bind:checked={settings.cardAudio} />
     <label for='card-audio'>{settings.cardAudio ? 'On' : 'Off'}</label>
   </div>
 </SettingCard>
-<SettingCard title='Prefer Dubs' description={'If your progress on a series matches the latest aired dubbed episode, the series will be hidden from Continue Watching until the next dub is available. Notifications will only be sent when a dubbed episode is released or if the series is sub-only (i.e., no dub exists).\n\nIf your progress goes beyond the latest dubbed episode, this setting will be ignored and the series will be treated as subbed. The Subbed Releases section will automatically hide dubbed series, and Dubbed Releases will hide subbed ones.\n\nThis setting is ideal for viewers who prefer dubbed content whenever available.'}>
+<SettingCard title='Prefer Dubs' description={'If your progress on a series matches the latest aired dubbed episode, the series will be hidden from Continue Watching until the next dub is available. Notifications will only be sent when a dubbed episode is released or if the series is sub-only (i.e., no dub exists).' + '\n\n' + 'If your progress goes beyond the latest dubbed episode, this setting will be ignored and the series will be treated as subbed. The Subbed Releases section will automatically hide dubbed series, and Dubbed Releases will hide subbed ones.' + '\n\n' + 'This setting is ideal for viewers who prefer dubbed content whenever available.'}>
   <div class='custom-switch fit-content'>
     <input type='checkbox' id='prefer-dubs' bind:checked={settings.preferDubs} />
     <label for='prefer-dubs'>{settings.preferDubs ? 'On' : 'Off'}</label>
   </div>
 </SettingCard>
-<SettingCard title='Spoiler Control' description={'Control how much episode and series information is hidden to avoid spoilers. Each level includes everything from the level below it, and only applies to anime matching your configured spoiler status.\n\nMinimal hides episode images. Moderate additionally hides episode descriptions, review counts, and tags considered media spoilers. Strict additionally hides episode titles, anime synopsis, ratings, and tags considered general spoilers. Hermit additionally hides episode durations.'}>
+<SettingCard title='Spoiler Control' description={'Control how much episode and series information is hidden to avoid spoilers. Each level includes everything from the level below it, and only applies to anime matching your configured spoiler status.' + '\n\n' + 'Minimal hides episode images. Moderate additionally hides episode descriptions, review counts, and tags considered media spoilers. Strict additionally hides episode titles, anime synopsis, ratings, and tags considered general spoilers. Hermit additionally hides episode durations.'}>
   <select class='form-control bg-dark w-150 mw-full text-truncate' bind:value={settings.spoilers} on:change={(event) => { if (event.target.value === 'off') settings.spoilerStatus = [] }}>
     <option value='off' selected>Off</option>
     <option value='minimal'>Minimal</option>
@@ -91,13 +133,13 @@
   </select>
 </SettingCard>
 {#if settings.spoilers !== 'off'}
-  <SettingCard title='Spoiler Status' description={'Define which list status types should have spoiler control active. Spoilers will only be hidden for anime matching a selected status. For example, adding "Watching" means only currently watching series will have spoilers hidden, while everything else will show normally.'}>
-    <div>
-      {#each settings.spoilerStatus as status, i}
+  <SettingCard class='d-md-block' title='Spoiler Status' description='Define which list status types should have spoiler control active. Spoilers will only be hidden for anime matching a selected status. For example, adding "Watching" means only currently watching series will have spoilers hidden, while everything else will show normally.'>
+    <div class='fit-content mt-10 mw-full ml-md-auto'>
+      {#each settings.spoilerStatus as status, i (i)}
         <div class='input-group mb-10 w-210 mw-full'>
           <select id='spoiler-status-{i}' class='w-100 form-control mw-full bg-dark text-truncate' bind:value={settings.spoilerStatus[i]}>
             <option disabled value=''>Select a status</option>
-            {#each listStatus.filter(option => option[1] !== 'COMPLETED').filter(option => !settings.spoilerStatus.includes(option[1]) || status === option[1]) as option}
+            {#each listStatus.filter(option => option[1] !== 'COMPLETED').filter(option => !settings.spoilerStatus.includes(option[1]) || status === option[1]) as option (option[1])}
               <option value='{option[1]}'>{option[0]}</option>
             {/each}
           </select>
@@ -106,19 +148,19 @@
           </div>
         </div>
       {/each}
-      <button type='button' disabled={listStatus.filter(option => option[1] !== 'COMPLETED').every(option => settings.spoilerStatus.includes(option[1]))} use:click={() => { settings.spoilerStatus = [...settings.spoilerStatus, ''] }} class='btn btn-primary mb-10 d-flex align-items-center justify-content-center'><span>Add Status</span></button>
+      <button type='button' disabled={listStatus.filter(option => option[1] !== 'COMPLETED').every(option => settings.spoilerStatus.includes(option[1]))} use:click={addSpoilerStatus} class='btn btn-primary mb-10 d-flex align-items-center justify-content-center'><span>Add Status</span></button>
     </div>
   </SettingCard>
 {/if}
-<SettingCard title='Adult Content' description={'Adult enables searching for adult (18+) rated anime, typically series with nudity. Hentai enables searching straight up Hentai. This includes adding the Hentai home feed, Hentai genre, and Hentai related tags for search queries.'}>
-  <select class='form-control bg-dark w-100 mw-full text-truncate' bind:value={settings.adult}>
+<SettingCard title='Adult Content' description='Adult enables searching for adult (18+) rated anime, typically series with nudity. Hentai enables searching straight up Hentai. This includes adding the Hentai home feed, Hentai genre, and Hentai related tags for search queries.'>
+  <select class='form-control bg-dark w-100 mw-full text-truncate' bind:value={settings.adult} on:change={(event) => ensureNotifyFeeds(event.currentTarget.value)}>
     <option value='none' selected>None</option>
     <option value='adult'>Adult</option>
     <option value='hentai'>Hentai</option>
   </select>
 </SettingCard>
 {#if settings.adult === 'hentai'}
-  <SettingCard title='Hentai Banner' description={'Changes the displayed series on the home page banner to be exclusively Hentai.'}>
+  <SettingCard title='Hentai Banner' description='Changes the displayed series on the home page banner to be exclusively Hentai.'>
     <div class='custom-switch fit-content'>
       <input type='checkbox' id='hentai-banner' bind:checked={settings.hentaiBanner} />
       <label for='hentai-banner'>{settings.hentaiBanner ? 'On' : 'Off'}</label>
@@ -163,7 +205,7 @@
   </SettingCard>
 {/if}
 <h4 class='mb-10 font-weight-bold'>Notification Settings</h4>
-<SettingCard title='System Notifications' description={'Allows custom system notifications to be sent, with this disabled you will still get in-app notifications. If you enable system notifications and have MULTIPLE Notification Feeds specified, such as RSS, Releases, and Anilist you WILL be spammed with multiple notifications. Consider choosing a single feed based on your needs.'}>
+<SettingCard title='System Notifications' description='Allows custom system notifications to be sent, with this disabled you will still get in-app notifications. If you enable system notifications and have MULTIPLE Notification Feeds specified, such as RSS, Releases, and Anilist you WILL be spammed with multiple notifications. Consider choosing a single feed based on your needs.'>
   <div class='custom-switch fit-content'>
     <input type='checkbox' id='system-notify' bind:checked={settings.systemNotify} />
     <label for='system-notify'>{settings.systemNotify ? 'On' : 'Off'}</label>
@@ -178,69 +220,95 @@
     </select>
   </SettingCard>
 {/if}
-{#each ['Sub', 'Dub', 'Hentai'] as type}
-  {#if type !== 'Hentai' || settings.adult === 'hentai'}
-    <SettingCard title='{type} Announcements' description={`Get ${type} announcement notifications when an airing date is confirmed. Choose to get all announcements, updates on sequels for related anime you're following, or turn off notifications entirely.`}>
-      <select class='form-control bg-dark w-120 mw-120 text-truncate' bind:value={settings[`${type.toLowerCase()}Announce`]}>
-        <option value='all' selected>All</option>
-        <option value='following' selected>Following</option>
-        <option value='none'>None</option>
-      </select>
-    </SettingCard>
-  {/if}
+<SettingCard class='announcement-notifications d-md-block' title='Releases Announcements' description='Get notified when an airing date is confirmed. Choose all announcements, sequels related to anime you follow, or none.'>
+  <div class='d-flex flex-column gap-10 mt-10 fit-content flex-shrink-0 mw-full ml-md-auto text-md-right'>
+    {#each ['Sub', 'Dub', ...(settings.adult === 'hentai' ? ['Hentai'] : [])] as type (type)}
+      <div class='d-flex flex-row-reverse flex-md-row align-items-center gap-20'>
+        <label for='announce-{type.toLowerCase()}' class='w-50 mb-0 flex-shrink-0'>{type}</label>
+        <select id='announce-{type.toLowerCase()}' class='form-control bg-dark w-150 flex-shrink-0 text-truncate' bind:value={settings[`${type.toLowerCase()}Announce`]}>
+          <option value='all'>All</option>
+          <option value='following'>Following</option>
+          <option value='none'>None</option>
+        </select>
+      </div>
+    {/each}
+  </div>
+</SettingCard>
+{#each [
+  { source: 'releases', name: 'release', title: 'Releases Notifications', description: 'Choose which Releases feeds can notify you for each list status. All feeds are enabled by default. At least one feed must stay enabled per status. Enable another feed before turning off the last one, or remove the status to stop notifications.' },
+  { source: 'rss', name: 'RSS', title: 'RSS Feed', description: 'When each RSS feed updates with new entries, notifications will be sent depending on your list status. These notifications will combine with Anilist and Releases notifications for the in-app notification tray.\n\nAt least one feed must stay enabled per status. Enable another feed before turning off the last one, or remove the status to stop notifications. If your RSS feed(s) mix audio types, you can toggle notifications for each audio type.' }
+] as { source, name, title, description } (source)}
+  {@const notifyKey = `${source}Notify`}
+  {@const disabledKey = `${notifyKey}Disabled`}
+  {@const types = ['Sub', 'Dub', ...(source === 'releases' && settings.adult === 'hentai' ? ['Hentai'] : [])]}
+  <SettingCard class='{source === "releases" ? "release" : source}-notifications d-md-block pl-10 pr-10 pl-sm-20 pr-sm-20' {title} {description}>
+    <div class='release-notify-rules fit-content mt-10 mw-full ml-md-auto'>
+      {#if settings[notifyKey].length}
+        <div class='release-notify-header d-grid align-items-center justify-content-start text-muted font-size-12 mb-5' aria-hidden='true'>
+          <div class='order-0 order-md-1'></div>
+          <div class='release-notify-feeds d-flex align-items-center text-center mx-5 mx-sm-10 ml-md-0 mr-md-10 order-1 order-md-0'>
+            {#each types as type (type)}
+              <span class='w-50 flex-shrink-0'>{type}</span>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#each settings[notifyKey] as status, i (i)}
+        {@const enabledTypes = types.filter(type => !settings[disabledKey]?.[status]?.includes(type))}
+        <div class='release-notify-rule d-grid align-items-center justify-content-start mb-10'>
+          <div class='release-notify-feeds d-flex align-items-center text-center mx-5 mx-sm-10 ml-md-0 mr-md-10 order-1 order-md-0'>
+            {#each types as type (type)}
+              <div class='release-notify-feed d-flex align-items-center justify-content-center w-50 flex-shrink-0'>
+                <div class='custom-switch'>
+                  <input type='checkbox' role='switch' id='{source}-notify-{type}-{i}' checked={!settings[disabledKey]?.[status]?.includes(type)} disabled={enabledTypes.length === 1 && enabledTypes.includes(type)} aria-describedby='{source}-notify-help' aria-label={`${type} ${name} notifications for ${listStatus.find(option => option[1] === status)?.[0] || 'new status'}`} on:change={(event) => {
+                    const disabled = settings[disabledKey]?.[status] || []
+                    settings[disabledKey] = { ...settings[disabledKey], [status]: event.currentTarget.checked ? disabled.filter(feed => feed !== type) : [...disabled, type] }
+                  }} />
+                  <label class='blank' for='{source}-notify-{type}-{i}'></label>
+                </div>
+              </div>
+            {/each}
+          </div>
+          <div class='release-notify-status input-group d-contents d-md-flex'>
+            <select id='{source}-notify-{i}' class='form-control bg-dark text-truncate' aria-label={`${name} notification list status`} on:change={(event) => updateNotifyStatus(source, i, event.currentTarget.value)}>
+              <option disabled value='' selected={status === ''}>Select a status</option>
+              {#each listStatus.filter(option => !settings[notifyKey].includes(option[1]) || status === option[1]) as option (option[1])}
+                <option value='{option[1]}' selected={status === option[1]}>{option[0]}</option>
+              {/each}
+            </select>
+            <div class='input-group-append order-2 order-md-0'>
+              <button type='button' aria-label={`Remove ${name} notification status`} use:click={() => updateNotifyStatus(source, i)} class='btn btn-danger btn-square px-5 d-flex align-items-center justify-content-center'><Trash2 size='1.8rem' /></button>
+            </div>
+          </div>
+        </div>
+      {/each}
+      <div class='release-notify-actions d-grid align-items-center justify-content-start'>
+        <div class='release-notify-feeds d-flex align-items-center text-center mx-5 mx-sm-10 ml-md-0 mr-md-10 order-1 order-md-0 invisible' aria-hidden='true'>
+          {#each types as type (type)}
+            <span class='w-50 flex-shrink-0'>{type}</span>
+          {/each}
+        </div>
+        <button type='button' disabled={listStatus.every(option => settings[notifyKey].includes(option[1]))} use:click={() => addNotifyStatus(source)} class='btn btn-primary fit-content mb-10 mr-10 d-flex align-items-center justify-content-center'><span>Add Status</span></button>
+      </div>
+    </div>
+  </SettingCard>
 {/each}
-<SettingCard title='Releases Notifications' description={`When a new episode is added to any of the Releases feeds, a notification will be sent depending on your list status.`}>
-  <div>
-    {#each settings.releasesNotify as status, i}
-      <div class='input-group mb-10 w-210 mw-full'>
-        <select id='dubs-notify-{i}' class='w-100 form-control mw-full bg-dark text-truncate' bind:value={settings.releasesNotify[i]} >
-          <option disabled value=''>Select a status</option>
-          {#each listStatus.filter(option => !settings.releasesNotify.includes(option[1]) || status === option[1]) as option}
-            <option value='{option[1]}'>{option[0]}</option>
-          {/each}
-        </select>
-        <div class='input-group-append'>
-          <button type='button' use:click={() => { settings.releasesNotify.splice(i, 1); settings.releasesNotify = settings.releasesNotify }} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center'><Trash2 size='1.8rem' /></button>
-        </div>
-      </div>
-    {/each}
-    <button type='button' disabled={listStatus.every(option => settings.releasesNotify.includes(option[1]))} use:click={() => { settings.releasesNotify = [...settings.releasesNotify, ''] }} class='btn btn-primary mb-10 mr-10 d-flex align-items-center justify-content-center'><span>Add Status</span></button>
-  </div>
-</SettingCard>
-<SettingCard title='RSS Feed' description={'When each RSS feed updates with new entries, notifications will be sent depending on your list status. These notifications will combine with Anilist and Releases notifications for the in-app notification tray.'}>
-  <div>
-    {#each settings.rssNotify as status, i}
-      <div class='input-group mb-10 w-210 mw-full'>
-        <select id='rss-notify-{i}' class='w-100 form-control mw-full bg-dark text-truncate' bind:value={settings.rssNotify[i]} >
-          <option disabled value=''>Select a status</option>
-          {#each listStatus.filter(option => !settings.rssNotify.includes(option[1]) || status === option[1]) as option}
-            <option value='{option[1]}'>{option[0]}</option>
-          {/each}
-        </select>
-        <div class='input-group-append'>
-          <button type='button' use:click={() => { settings.rssNotify.splice(i, 1); settings.rssNotify = settings.rssNotify }} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center'><Trash2 size='1.8rem' /></button>
-        </div>
-      </div>
-    {/each}
-    <button type='button' disabled={listStatus.every(option => settings.rssNotify.includes(option[1]))} use:click={() => { settings.rssNotify = [...settings.rssNotify, ''] }} class='btn btn-primary mb-10 d-flex align-items-center justify-content-center'><span>Add Status</span></button>
-  </div>
-</SettingCard>
 
 <h4 class='mb-10 font-weight-bold'>Home Screen Settings</h4>
 {#if Helper.isAuthorized()}
-  <SettingCard title='Hide My Anime' description={'The anime on your Watching, Rewatching, Completed, and Dropped list will automatically be hidden from the default sections, this excludes manually added RSS feeds and user specific feeds.'}>
+  <SettingCard title='Hide My Anime' description='The anime on your Watching, Rewatching, Completed, and Dropped list will automatically be hidden from the default sections, this excludes manually added RSS feeds and user specific feeds.'>
     <div class='custom-switch fit-content'>
       <input type='checkbox' id='hide-my-anime' bind:checked={settings.hideMyAnime} />
       <label for='hide-my-anime'>{settings.hideMyAnime ? 'On' : 'Off'}</label>
     </div>
   </SettingCard>
 {/if}
-<SettingCard title='RSS Feeds' description={`RSS feeds to display on the home screen. This needs to be a CORS enabled URL to a RSS feed which contains either an "infoHash" or "enclosure" tag. This only shows the releases on the home screen, it doesn't automatically download the content.\n\nSince the feeds only provide the name of the file, Shiru might not always detect the anime correctly! Some presets for popular groups are already provided as an example, custom feeds require the FULL URL. Be aware that adding more than 5 RSS URLs could result in getting rate limited. These will always be resolved and handle notifications so not adding them as a home sections makes no difference.`}>
+<SettingCard title='RSS Feeds' description={'RSS feeds to display on the home screen. This needs to be a CORS enabled URL to a RSS feed which contains either an "infoHash" or "enclosure" tag. This only shows the releases on the home screen, it doesn\'t automatically download the content.' + '\n\n' + 'Since the feeds only provide the name of the file, Shiru might not always detect the anime correctly! Some presets for popular groups are already provided as an example, custom feeds require the FULL URL. Be aware that adding more than 5 RSS URLs could result in getting rate limited. These will always be resolved and handle notifications so not adding them as a home sections makes no difference.'}>
   <div>
-    {#each settings.rssFeedsNew as _, i}
+    {#each settings.rssFeedsNew as _, i (i)}
       <div class='input-group mb-10 w-500 mw-full'>
         <input type='text' class='form-control w-150 mw-full bg-dark text-truncate' placeholder='New Releases' autocomplete='off' bind:value={settings.rssFeedsNew[i][0]} />
-        <input id='rss-feed-{i}' type='text' list='rss-feed-list-{i}' class='w-400 form-control mw-full bg-dark text-truncate' placeholder={'https://feed.example.com/rss2?qx=1&q="[Name] "'} autocomplete='off' bind:value={settings.rssFeedsNew[i][1]} />
+        <input id='rss-feed-{i}' type='text' list='rss-feed-list-{i}' class='w-400 form-control mw-full bg-dark text-truncate' placeholder='https://feed.example.com/rss2?qx=1&q="[Name] "' autocomplete='off' bind:value={settings.rssFeedsNew[i][1]} />
         <div class='input-group-append'>
           <button type='button' use:click={() => { settings.rssFeedsNew.splice(i, 1); settings.rssFeedsNew = settings.rssFeedsNew }} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center'><Trash2 size='1.8rem' /></button>
         </div>
@@ -249,9 +317,9 @@
     <button type='button' use:click={() => { settings.rssFeedsNew[settings.rssFeedsNew.length] = ['New Releases', null] }} class='btn btn-primary mb-10 d-flex align-items-center justify-content-center'><span>Add Feed</span></button>
   </div>
 </SettingCard>
-<SettingCard title='Custom Sections' description={'Create custom sections that can be added to the home screen.'}>
+<SettingCard title='Custom Sections' description='Create custom sections that can be added to the home screen.'>
   <div>
-    {#each settings.customSections as _, i}
+    {#each settings.customSections as _, i (i)}
       {#if i === 0}
         <div class='d-flex mb-5 w-480 mw-full'>
           <div class='flex-shrink-1 w-150 font-size-16 text-center font-weight-bold'>Name</div>
@@ -263,11 +331,11 @@
       <div class='d-flex mb-10 w-480 mw-full'>
         <div class='position-relative flex-shrink-1 w-150'>
           <input
-            type='text'
-            class='form-control bg-dark fix-border-right text-capitalize text-truncate'
-            placeholder='Name'
-            autocomplete='off'
-            bind:value={settings.customSections[i][0]}
+              type='text'
+              class='form-control bg-dark fix-border-right text-capitalize text-truncate'
+              placeholder='Name'
+              autocomplete='off'
+              bind:value={settings.customSections[i][0]}
           />
         </div>
         <div class='position-relative flex-shrink-1 w-150'>
@@ -291,6 +359,25 @@
 </SettingCard>
 
 <style>
+  .release-notify-rule, .release-notify-header, .release-notify-actions {
+    grid-template-columns: minmax(0, 17.5rem) auto var(--button-height);
+  }
+  .release-notify-feed, .release-notify-feeds > span {
+    width: var(--switch-width);
+  }
+  .release-notify-feed label {
+    height: var(--switch-height);
+  }
+  @media (min-width: 769px) {
+    .release-notify-rule, .release-notify-header, .release-notify-actions {
+      grid-template-columns: auto minmax(0, calc(17.5rem + var(--button-height)));
+    }
+  }
+  @media (max-width: 768px) {
+    .release-notify-status > .form-control, .release-notify-status > .input-group-append > .btn {
+      border-radius: var(--base-border-radius) !important;
+    }
+  }
   .w-210 {
     width: 21rem;
   }

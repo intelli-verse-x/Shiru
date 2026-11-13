@@ -1,6 +1,95 @@
 import type { SvelteComponentTyped } from 'svelte'
 
-export {}
+export interface Torrent {
+  infoHash: string
+  name: string
+  size: number
+  current?: boolean
+  staging?: boolean
+  seeding?: boolean
+  resolving?: boolean
+  verifying?: boolean
+  progress: number
+  downloaded: number
+  numSeeders: number
+  totalSeeders: number
+  numLeechers: number
+  totalLeechers: number
+  numPeers: number
+  downloadSpeed: number
+  uploadSpeed: number
+  magnetURI?: string
+  date: string
+  incomplete?: boolean
+  missing_pieces?: boolean
+  eta?: number | null
+  ratio: number
+  pieces?: number[] | null
+  cachedAt: number
+  media?: TorrentMedia
+}
+
+export interface FileMedia {
+  anilist_id?: number
+  mal_id?: number
+  episode?: number | string | null
+  episodeRange?: { first: number; last: number } | null
+  season?: number | string | null
+  failed: boolean
+  locked: boolean
+}
+
+export interface TorrentMedia {
+  default?: FileMedia
+  files?: Record<string, FileMedia>
+}
+
+/** Serializable file description returned when a torrent becomes playable. */
+export interface TorrentFile {
+  mediaData?: FileMedia
+  infoHash: string
+  fileHash: string
+  torrent_name: string
+  name: string
+  type: string
+  size: number
+  path: string
+  url: string
+}
+
+/** Identifier persisted for the current or a pending staged torrent. */
+export interface TorrentSource {
+  id?: string | Uint8Array
+  infoHash?: string
+  local?: boolean
+}
+
+export interface TorrentTrack {
+  number: number
+  type: string
+  header?: string
+  name?: string
+  language: string
+  default: boolean
+  forced: boolean
+}
+
+export interface TorrentChapter {
+  start: number
+  end: number
+  text?: string
+  language?: string
+}
+
+export interface TorrentUpdate {
+  current?: TorrentSource & { stats?: Torrent }
+  staging?: Torrent
+  seeding?: Torrent
+  completed?: Torrent
+  untrack?: boolean
+}
+
+type TorrentReady = (files: TorrentFile[], magnet: { magnet: string; hash: string }) => void
 
 type Track = {
   selected: boolean
@@ -16,42 +105,30 @@ declare global {
     torrent: {
       reload: () => void
       onCrash: (callback: () => void) => void
-      onRequest: (callback: (updateVersion: any) => void) => void
-      debug: (debug: any) => void
-      rescan: () => Promise<{ missingCount: number, removedCount: number }>,
-      scrape: (id: any, infoHashes: any) => Promise<any>
-      stream: (id: any, hash: any, magnet: any, base64: any) => void
-      stage: (id: any, hash: any) => void
-      complete: (hash: any) => void
-      unload: (data: any) => void
-      untrack: (hash: any) => void
-      reannounce: (hash: any) => void
-      onStats: (callback: (data: any) => void) => void
-      onFiles: (callback: (data: any) => void) => void
-      onMagnet: (callback: (data: any) => void) => void
-      onTracks: (callback: (data: any) => void) => void
-      offTracks: () => void
-      onSubtitles: (cbSubtitle: any, cbFont: any, cbFiles: any) => void
-      offSubtitles: () => void
-      onChapters: (callback: (data: any) => void) => void
-      onProgress: (callback: (data: any) => void) => void
-      onCurrentStats: (callback: (data: any) => void) => void
-      onExternalReady: (callback: (data: any) => void) => void
-      onExternalWatched: (callback: (data: any) => void) => void
-      onAndroidExternal: (callback: (data: any) => void) => void
-      onLoaded: (callback: (data: any) => void) => void
-      onUntrack: (callback: (data: any) => void) => void
-      onStage: (callback: (data: any) => void) => void
-      onSeed: (callback: (data: any) => void) => void
-      onComplete: (callback: (data: any) => void) => void
-      onCompletedStats: (callback: (data: any) => void) => void
-      setPlayback: (current: any, external: any) => void
-      restoreSession: (staging: any, seeding: any, completed: any, current: any) => void
-      launchExternal: (current: any) => void
-      updateNetwork: (status: any) => void
-      updateSettings: (settings: any) => void
-      onNotify: (callback: (type: string, detail: any) => void) => void
-      portRequest: (settings: any) => Promise<void>
+      onRequest: (callback: (request: { magnet: string; base64?: boolean }) => void) => void
+      debug: (debug: string) => Promise<void>
+      rescan: () => Promise<{ missingCount: number, removedCount: number }>
+      setMedia: (hash: string, data: FileMedia & { path?: string; fileHash?: string }, overwrite?: boolean) => Promise<TorrentMedia>
+      scrape: (infoHashes: string[]) => Promise<{ hash: string; complete: number; incomplete: number; downloaded?: number }[]>
+      stream: (id: string | Uint8Array, hash?: string | false | null, magnet?: boolean | null, base64?: boolean, onReady?: TorrentReady) => Promise<Partial<Torrent> | void>
+      stage: (id: string | Uint8Array, hash?: string | false | null, base64?: boolean) => Promise<Partial<Torrent> | void>
+      complete: (hash: string) => Promise<void>
+      unload: (data?: string | TorrentSource | { torrent: string; hash?: string | boolean } | null) => Promise<void>
+      untrack: (hash: string) => Promise<void>
+      reannounce: (hash: string) => Promise<void>
+      subscribe: (notify: (level: string, message: string) => void, updateTorrent: (hash: string | null, update: TorrentUpdate) => void) => Promise<void>
+      getTorrentStats: (infoHash: string) => Promise<(Omit<Torrent, 'pieces'> & { fileProgress: number }) | null>
+      getDiskSpace: () => Promise<{ total: number, free: number }>
+      getTracks: () => Promise<TorrentTrack[] | null>
+      getChapters: () => Promise<TorrentChapter[] | null>
+      onSubtitles: (cbSubtitle: (packet: { subtitle: any; trackNumber: number }) => void, cbFont: (font: { url: string }) => void, cbFiles: (file: { name: string; url: string }) => void | Promise<void>) => Promise<void | null>
+      offSubtitles: () => Promise<void | null>
+      setPlayback: (infoHash: string, path: string, external: boolean) => Promise<true | void>
+      restoreSession: (staging: (string | TorrentSource)[] | null, seeding: string[] | null, completed: string[] | null, current?: string | TorrentSource | null, onReady?: TorrentReady) => Promise<Torrent[]>
+      launchExternal: (path: string, externalWatched?: () => void) => Promise<string | void>
+      updateNetwork: (status: string) => Promise<void>
+      updateSettings: (settings: Record<string, any>) => Promise<void>
+      portRequest: (settings: Record<string, any>) => Promise<void>
     }
     common: {
       getAppVersion: () => Promise<string>
@@ -65,6 +142,7 @@ declare global {
       openURI: (uri: string) => Promise<any>
       pickFile: (title: string) => Promise<string>
       pickFolder: (title: string) => Promise<string>
+      pickMediaFiles: () => Promise<{ paths?: string[]; torrents?: Uint8Array[] }>
       linkAccount: (uri: string) => Promise<any>
       handleProtocol: (data: any) => void
       setUpdateChannel: (channel: 'stable' | 'nightly') => void
@@ -81,10 +159,15 @@ declare global {
       onRequestPlay: (callback: (opts: any) => void) => void
     }
     android?: {
-      minimize: () => void
+      exit: () => void
       showSplash: () => void
       toast: (text: string, duration?: 'short' | 'long') => Promise<void>
       onBackButton: (callback: (event: any) => void) => void
+      onAppStateChange: (callback: (isActive: boolean) => void) => Promise<{ remove: () => Promise<void> }>
+      onPictureInPictureModeChanged: (callback: (isInPictureInPictureMode: boolean) => void) => Promise<{ remove: () => Promise<void> }>
+      onMediaAction: (callback: (action: 'play' | 'pause' | 'last' | 'next' | 'seek', position?: number) => void) => Promise<{ remove: () => Promise<void> }>
+      setMediaSession: (state: { active: boolean; playing?: boolean; title?: string; subtitle?: string; artwork?: string; position?: number; duration?: number; playbackRate?: number; hasLast?: boolean; hasNext?: boolean }) => Promise<void>
+      exitPiP: () => void
       hideStatusBar: () => void
       setSystemStyle: (style: 'LIGHT' | 'DARK') => void
       requestFileAccess: () => Promise<{ granted: boolean; error?: string | null }>
@@ -92,6 +175,8 @@ declare global {
     }
     electron?: {
       exit: () => void
+      cacheFlushed: () => void
+      onFlushCache: (callback: () => void) => void
       setDoH: (url: string) => void
       getAngle: () => Promise<string>
       setAngle: (angle: any) => void
@@ -108,6 +193,8 @@ declare global {
       setDiscordRPC: (state: any) => void
       setPresence: (activity: any) => void
       clearPresence: () => void
+      showTextContextMenu: (options: { editable: boolean; textField: boolean; hasSelection: boolean; canUndo: boolean; canRedo: boolean }) => void
+      onSelectContextText: (callback: () => void) => void
       getYouTube: () => Promise<string>
     }
   }

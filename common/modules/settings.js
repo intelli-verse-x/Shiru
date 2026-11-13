@@ -37,8 +37,10 @@ function setDefaults() {
   }
 }
 
-/** @type {import('simple-store-svelte').Writable<number[]>} */
-export const sync = writable(cache.getEntry(caches.GENERAL, 'sync') || [])
+const storedProfiles = JSON.parse(localStorage.getItem('profiles')) || []
+
+/** @type {import('simple-store-svelte').Writable<string[]>} */
+export const sync = writable((cache.getEntry(caches.GENERAL, 'sync') || []).flatMap(id => typeof id === 'number' ? storedProfiles.filter(profile => profile?.viewer?.data?.Viewer?.id === id).map(getProfileKey) : [id]))
 
 sync.subscribe(value => {
   cache.setEntry(caches.GENERAL, 'sync', value)
@@ -58,7 +60,7 @@ function resetSettings () {
 }
 
 /** @type {import('simple-store-svelte').Writable<typeof defaults>} */
-export const profiles = writable(JSON.parse(localStorage.getItem('profiles')) || [])
+export const profiles = writable(storedProfiles)
 
 profiles.subscribe(value => {
   localStorage.setItem('profiles', JSON.stringify(value))
@@ -185,10 +187,16 @@ async function handleMalToken (code, state) {
 }
 
 export async function refreshMalToken (token) {
+  const fingerprint = async value => {
+    if (!value) return 'none'
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+    return 'sha256:' + Array.from(new Uint8Array(hash).slice(0, 6), byte => byte.toString(16).padStart(2, '0')).join('')
+  }
   const { clientID } = await import('./providers/myanimelist/myanimelist.js')
   const profile = malToken?.token === token ? malToken : profiles.value.find(profile => profile.token === token)
   const refresh = profile?.refresh
-  debug(`Attempting to refresh authorization token ${token} with the refresh token ${refresh}`)
+  const [tokenId, refreshId] = await Promise.all([fingerprint(token), fingerprint(refresh)])
+  debug(`Attempting to refresh authorization token ${tokenId} with the refresh token ${refreshId}`)
   let response
   if (refresh && refresh.length > 0) {
     response = await fetch('https://myanimelist.net/v1/oauth2/token', {
@@ -210,7 +218,7 @@ export async function refreshMalToken (token) {
         duration: Infinity
       })
     }
-    debug(`Failed to refresh MyAnimeList User Token ${ !refresh || refresh.length <= 0 ? 'as the refresh token could not be fetched!' : 'the refresh token has likely expired: ' + JSON.stringify(response)}`)
+    debug(`Failed to refresh MyAnimeList User Token ${!refresh || refresh.length <= 0 ? 'as the refresh token could not be fetched!' : 'the refresh token has likely expired: ' + JSON.stringify(response)}`)
     if (malToken?.token === token) {
       malToken.reauth = true
       localStorage.setItem('MALviewer', JSON.stringify(malToken))
@@ -236,12 +244,17 @@ export async function refreshMalToken (token) {
         })
     )
   }
-  debug(`Successfully refreshed authorization token, updated to token ${oauth.access_token} with the refresh token ${oauth.refresh_token}`)
+  debug(`Successfully refreshed authorization token ${tokenId} to ${await fingerprint(oauth.access_token)}, refresh token ${refreshId} to ${await fingerprint(oauth.refresh_token)}`)
   return oauth
+}
+
+export function getProfileKey(profile) {
+  return `${profile?.viewer?.data?.Viewer?.avatar ? 'anilist' : 'myanimelist'}:${profile?.viewer?.data?.Viewer?.id}`
 }
 
 export async function swapProfiles(profile, newProfile) {
   const currentProfile = isAuthorized()
+  const isSameProfile = candidate => getProfileKey(candidate) === getProfileKey(profile)
   if (!isAuthorized() && profile != null) await cache.abandon(profile.viewer.data.Viewer.id)
 
   if (profile == null && profiles.value.length > 0) {
@@ -252,14 +265,14 @@ export async function swapProfiles(profile, newProfile) {
         return profiles.slice(1)
     })
   } else if (profile != null) {
-    if (profile?.viewer?.data?.Viewer?.id === currentProfile?.viewer?.data?.Viewer?.id && newProfile) {
+    if (newProfile && isSameProfile(currentProfile)) {
       localStorage.setItem(alToken ? 'ALviewer' : 'MALviewer', JSON.stringify(profile))
-    } else if (profiles.value.some(p => p.viewer?.data?.Viewer?.id === profile?.viewer?.data?.Viewer?.id && newProfile)) {
-      profiles.update(profiles => profiles.map(p => p.viewer?.data?.Viewer?.id === profile?.viewer?.data?.Viewer?.id ? profile : p))
+    } else if (newProfile && profiles.value.some(isSameProfile)) {
+      profiles.update(profiles => profiles.map(p => isSameProfile(p) ? profile : p))
     } else {
       if (currentProfile) profiles.update(currentProfiles => [currentProfile, ...currentProfiles])
       setViewer(profile)
-      profiles.update(profiles => profiles.filter(p => p.viewer?.data?.Viewer?.id !== profile.viewer?.data?.Viewer?.id))
+      profiles.update(profiles => profiles.filter(p => !isSameProfile(p)))
     }
   } else {
     await cache.abandon('default')

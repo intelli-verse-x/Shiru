@@ -114,7 +114,7 @@
 {/if}
 <h4 class='mb-10 font-weight-bold'>Subtitle Settings</h4>
 {#if supportsLocalFonts}
-  <SettingCard title='Default Subtitle Font' description={"What font to use when the current loaded video doesn't provide or specify one.\nThis uses fonts installed on your OS."}>
+  <SettingCard title='Default Subtitle Font' description={"What font to use when the current loaded video doesn't provide or specify one." + '\n' + 'This uses fonts installed on your OS.'}>
     <div class='input-group w-400 mw-full'>
       <select class='form-control bg-dark' style={settings.font?.name ? `font-family: 'lfa-${settings.font.name}'` : `font-family: Roboto`} bind:value={selectedFont} on:click|once={loadFonts} on:change={changeFont}>
         <!-- Placeholder shown when no font is selected -->
@@ -127,9 +127,9 @@
             <option value={settings.font.name} style="font-family: 'lfa-{settings.font.name}'">{settings.font.name}</option>
           </optgroup>
         {/if}
-        {#each Object.entries($fontFamilies) as [familyName, variants]}
+        {#each Object.entries($fontFamilies) as [familyName, variants] (familyName)}
           <optgroup label={familyName} style="font-family: 'lfa-{familyName}'">
-            {#each variants as { fullName }}
+            {#each variants as { fullName }, variantIndex (variantIndex)}
               <option value={fullName} style="font-family: 'lfa-{fullName}'">
                 {fullName}
               </option>
@@ -229,6 +229,15 @@
     </div>
   </SettingCard>
 {/if}
+{#if SUPPORTS.isAndroid}
+  <SettingCard title='Auto-Fullscreen Playback' description='If playback should automatically enter fullscreen when loading a torrent.'>
+    <div class='custom-switch fit-content'>
+
+      <input type='checkbox' id='player-auto-fullscreen' bind:checked={settings.autoFullscreen} />
+      <label for='player-auto-fullscreen'>{settings.autoFullscreen ? 'On' : 'Off'}</label>
+    </div>
+  </SettingCard>
+{/if}
 <SettingCard title='Deband Video' description='Reduces banding on dark and compressed videos. High performance impact, not recommended for high quality videos.'>
   <div class='custom-switch fit-content'>
     <input type='checkbox' id='player-deband' bind:checked={settings.playerDeband} />
@@ -277,7 +286,7 @@
       </div>
       <input type='url' class='form-control bg-dark text-truncate mw-100' readonly value={settings.playerPath} placeholder='Choose an executable...' />
       <div class='input-group-prepend'>
-        <button type='button' use:click={() => settings.playerPath = ''} disabled={!settings.playerPath} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center' title='Reset Location'><Eraser size='1.8rem' /></button>
+        <button type='button' use:click={() => (settings.playerPath = '')} disabled={!settings.playerPath} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center' title='Reset Location'><Eraser size='1.8rem' /></button>
       </div>
     </div>
   </SettingCard>

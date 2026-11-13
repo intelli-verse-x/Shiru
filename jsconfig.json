@@ -1,30 +1,34 @@
 {
   "compilerOptions": {
-    "checkJs": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
     "target": "ESNext",
-    "moduleResolution": "node",
+    "moduleResolution": "Bundler",
     "module": "ESNext",
     "allowSyntheticDefaultImports": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "resolveJsonModule": true,
-    "sourceMap": true,
     "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "maxNodeModuleJsDepth": 0,
     "skipLibCheck": true,
     "paths": {
       "@/*": ["./common/*"],
       "three": ["./types.d.ts"],
       "rxjs": ["./types.d.ts"],
       "@client/*": ["./client/*"],
+      "bridge": ["./types.d.ts"],
       "debug": ["./common/modules/lib/debug.js"],
       "webtorrent-client": ["./client/core/webtorrent.js"],
-      "http-tracker": ["./node_modules/bittorrent-tracker/lib/client/http-tracker.js"]
+      "http-tracker": ["./types.d.ts"]
     },
-    "types": ["@cloudflare/workers-types", "./types.d.ts"]
+    "types": ["node"]
   },
   "exclude": [
     "node_modules", "dist", "build", "git_modules", ".svelte-kit", "public", "android", "@types/three",
     "**/node_modules", "**/dist", "**/build", "**/git_modules", "**/.svelte-kit", "**/public", "**/android", "**/@types/three",
-    "**/node_modules/*", "**/dist/*", "**/build/*", "**/git_modules/*", "**/.svelte-kit/*", "**/public/*", "**/android/*", "**@types/three/*.d.ts"
+    "**/node_modules/*", "**/dist/*", "**/build/*", "**/git_modules/*", "**/.svelte-kit/*", "**/public/*", "**/android/*", "**/@types/three/*.d.ts"
   ]
 }

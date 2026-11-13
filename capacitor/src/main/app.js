@@ -1,4 +1,3 @@
-/* globals AndroidFullScreen, PictureInPicture */
 import { LocalNotifications } from '@capacitor/local-notifications'
 import { SystemBars, SystemBarType } from '@capacitor/core'
 import { SplashScreen } from '@capacitor/splash-screen'
@@ -14,6 +13,7 @@ import Dialog from './dialog.js'
 
 import { development, loadingClient } from './util.js'
 import { ipcWire } from './ipc.js'
+import './scrollbars.js'
 
 export default class App {
   protocol = new Protocol()
@@ -64,32 +64,55 @@ export default class App {
       level === 'error' ? console.error(message) : console.debug(message)
     })
 
-    ipcWire.handle('torrent:portRequest', async (event, settings) => {
+    ipcWire.handle('torrent:portRequest', async (event, { settings, requestId }) => {
+      /** @type {import('@capacitor/core').PluginListenerHandle|undefined} */
+      let messageListener
       const port = {
-        onmessage: cb => {
-          NodeJS.addListener('ipc', ({ args }) => cb(args[0]))
+        onmessage: async cb => {
+          messageListener = await NodeJS.addListener('torrent:message', ({ args }) => {
+            if (args[0]?.requestId === requestId) cb({ data: args[0].data })
+          })
         },
-        postMessage: (data, b) => {
-          NodeJS.send({ eventName: 'ipc', args: [{ data }] })
-        }
+        postMessage: data => NodeJS.send({ eventName: 'torrent:message', args: [{ requestId, data }] }),
+        close: async () => messageListener?.remove()
       }
       await this.ready
       this.handleNotify = true
-      NodeJS.send({ eventName: 'port-init', args: [] })
-      let stethoscope = true
-      return new Promise(resolve => {
-        NodeJS.addListener('webtorrent-heartbeat', () => {
-          if (stethoscope) {
-            stethoscope = false
-            NodeJS.send({ eventName: 'main-heartbeat', args: [settings] })
-            NodeJS.addListener('torrentRequest', () => {
-              NodeJS.send({ eventName: 'torrentPort', args: [] })
+      /** @type {import('@capacitor/core').PluginListenerHandle[]} */
+      const listeners = []
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
+      let timer
+      /** @type {boolean} */
+      let settled = false
+      try {
+        return await new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Torrent initialization timed out')), 15_000)
+          const onReady = async ({ args }) => {
+            if (settled || args[0] !== requestId) return
+            try {
+              await NodeJS.send({ eventName: 'torrent:connect', args: [requestId] })
+              if (settled) return
+              loadingClient.resolve()
               resolve(port)
-            })
-            loadingClient.resolve()
+            } catch (error) { reject(error) }
           }
+          Promise.all([
+            NodeJS.addListener('torrent:ready', onReady),
+            NodeJS.addListener('torrent:init-error', ({ args }) => {
+              if (args[0] === requestId) reject(new Error(args[1]))
+            })
+          ].map(registration => registration.then(handle => {
+            if (settled) return handle.remove()
+            listeners.push(handle)
+          }))).then(() => {
+            if (!settled) return NodeJS.send({ eventName: 'torrent:init', args: [{ settings, requestId }] })
+          }).catch(reject)
         })
-      })
+      } finally {
+        settled = true
+        clearTimeout(timer)
+        await Promise.all(listeners.map(listener => listener.remove()))
+      }
     })
     ipcWire.on('torrent:reload', () => NodeJS.send({ eventName: 'torrent:reload', args: [] }))
 
@@ -97,7 +120,7 @@ export default class App {
     LocalNotifications.checkPermissions().then(value => {
       if (value?.display !== 'granted') {
         try {
-          LocalNotifications.requestPermissions().then(() => this.canNotify = true)
+          LocalNotifications.requestPermissions().then(() => (this.canNotify = true))
         } catch (error) {
           console.debug(error)
         }
@@ -127,7 +150,8 @@ export default class App {
           body: opts.message,
           actionTypeId: opts.button?.length > 1 ? opts.button[0].text?.includes('Start') ? 'start_watching' : (opts.button[0].text?.includes('Continue') ? 'continue_watching' : (opts.button[0].text?.includes('Update') ? 'update_app' : 'watch_now')) : (opts.button?.length ? 'view_anime' : undefined),
           attachments: [{ id: 'my_preview', url: opts.heroImg || opts.iconXL || opts.icon }],
-          extra: { buttons: opts.button }
+          extra: { buttons: opts.button },
+          isExactNotification: false,
         }]
       })
     })

@@ -9,7 +9,7 @@ publish:
     repo: shiru
 electronDownload:
   mirror: https://packages.shiru.app/electron/
-  customDir: "42.9.0"
+  customDir: "45.2.3"
 protocols:
   name: shiru
   schemes:
@@ -27,7 +27,7 @@ directories:
   buildResources: buildResources
 asarUnpack: "**/*.node"
 toolsets:
-  appimage: "1.0.2"
+  appimage: "1.0.3"
 portable:
   artifactName: ${os}-${productName}-v${version}-portable.${ext}
 nsis:
@@ -46,7 +46,7 @@ linux:
   category: AudioVideo;Video
   synopsis: *synopsis
   description: *description
-  maintainer: RockinChaos <RockinChaos@users.noreply.github.com>
+  maintainer: RockinChaos <maintainer@shiru.app>
   syncDesktopName: true
   desktop:
     entry:
@@ -85,6 +85,8 @@ flatpak:
     - --talk-name=org.kde.StatusNotifierWatcher
 mac:
   artifactName: ${os}-${productName}-v${version}.${ext}
+  files:
+    - "!node_modules/utp-native/build{,/**/*}"
   singleArchFiles: node_modules/+(register-scheme|utp-native|fs-native-extensions)/**
   entitlements: buildResources/entitlements.mac.plist
   category: public.app-category.video

@@ -20,10 +20,17 @@ const isDev = location.hostname === 'localhost'
 
 const video = document.createElement('video')
 if (!isDev) {
-  if (!video.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"')) exclusions.push('HEVC', 'x265', 'H.265', '[EMBER]')
-  if (!video.canPlayType('audio/mp4; codecs="ac-3"')) exclusions.push('AC3', 'AC-3')
+  const supportsAC3 = video.canPlayType('audio/mp4; codecs="ac-3"')
+  const supportsEAC3 = video.canPlayType('audio/mp4; codecs="ec-3"')
+  const supportsTrueHD = video.canPlayType('audio/mp4; codecs="truehd"')
+  if (!video.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"')) exclusions.push('HEVC', 'x265', 'H.265')
+  if (!video.canPlayType('video/mp4; codecs="mpeg2video"')) exclusions.push('MPEG2', 'MPEG-2')
+  if (!supportsAC3) exclusions.push('AC3', 'AC-3', 'DD2.0', 'DD5.1')
+  if (!supportsEAC3) exclusions.push('EAC3', 'E-AC3', 'E-AC-3', 'DDP', 'DD+', 'Dolby')
   if (!video.canPlayType('audio/mp4; codecs="dtsc"')) exclusions.push('DTS')
-  if (!video.canPlayType('audio/mp4; codecs="truehd"')) exclusions.push('TrueHD')
+  if (!supportsTrueHD) exclusions.push('TrueHD', 'True-HD')
+  if (!video.canPlayType('audio/mp4; codecs="mlp"')) exclusions.push('MLP')
+  if (!supportsEAC3 && !supportsTrueHD) exclusions.push('Atmos')
   if (!('audioTracks' in HTMLVideoElement.prototype)) exclusions.push('DUAL')
 }
 video.remove()
@@ -72,7 +79,7 @@ export async function getTorrentResults({ media, episode, batch, movie, resoluti
     const deduped = dedupe(results)
     if (!deduped.length) return []
     const parseObjects = await anitomyscript(deduped.map(r => r.title))
-    deduped.forEach((r, i) => r.parseObject = parseObjects[i])
+    deduped.forEach((r, i) => (r.parseObject = parseObjects[i]))
     return updatePeerCounts(deduped, !settings.value.torrentAutoScrape)
   })
 }
@@ -166,11 +173,10 @@ export async function updatePeerCounts(entries, cacheOnly = false) {
     return entries
   }
 
-  const id = Math.trunc(Math.random() * Number.MAX_SAFE_INTEGER).toString()
   debug(`Updating peer counts for ${toScrape.length} entries (${entries.length - toScrape.length} served from cache)`)
 
   const updated = await Promise.race([
-    TORRENT.scrape(id, entries.map(entry => entry.hash)),
+    TORRENT.scrape(entries.map(entry => entry.hash)),
     sleep(15_000).then(() => { throw new Error('Scrape timed out') })
   ]).catch(error => {
     debug('Scrape failed:', error.message)
@@ -199,13 +205,13 @@ export async function updatePeerCounts(entries, cacheOnly = false) {
 
 /** @param {import('@/modules/providers/anilist/al.d.ts').Media} media */
 async function ALToAniDB (media) {
-  const json = await getAniMappings(media?.id) || {}
+  const json = await getAniMappings(media) || {}
   if (json.mappings?.anidb_id) return json
 
   const parentID = getParentForSpecial(media)
   if (!parentID) return
 
-  return getAniMappings(parentID)
+  return getAniMappings({ id: parentID })
 }
 
 /** @param {import('@/modules/providers/anilist/al.d.ts').Media} media */

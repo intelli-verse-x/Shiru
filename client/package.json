@@ -1,11 +1,12 @@
 {
   "name": "client",
-  "packageManager": "pnpm@10.34.1",
+  "packageManager": "pnpm@12.17.0",
   "private": true,
   "dependencies": {
     "bencode": "^4.0.1",
+    "uint8-util": "^2.3.2",
     "bittorrent-tracker": "^11.2.3",
-    "matroska-metadata": "github:cedarpolar/matroska-metadata#b36dd003c41da5acd11c70144c13aef16a5603ee",
+    "@rockinchaos/matroska-metadata": "github:RockinChaos/matroska-metadata#51df7d575b6390fef51def2673acdf44a3fbe251",
     "parse-torrent": "^11.0.24",
     "webtorrent": "^3.0.21"
   }

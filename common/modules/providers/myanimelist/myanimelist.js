@@ -4,7 +4,7 @@ import Bottleneck from 'bottleneck'
 import { malToken, refreshMalToken, settings } from '@/modules/settings.js'
 import { mediaCache } from '@/modules/cache.js'
 import { sleep, uniqueStore } from '@/modules/util.js'
-import { printError, status } from '@/modules/networking.js'
+import { printError, status, previousStatus } from '@/modules/networking.js'
 import { MutationQueue } from '@/modules/providers/lib/mutationqueue.js'
 import Helper from '@/modules/providers/helper.js'
 import Debug from 'debug'
@@ -51,6 +51,8 @@ class MALClient {
 
   #listPromise = Promise.resolve()
 
+  #isFlushingMutations = false
+
   /** @type {import('simple-store-svelte').Writable<ReturnType<MALClient['getUserLists']>>} */
   userLists = writable()
 
@@ -76,26 +78,33 @@ class MALClient {
 
     if (this.userID?.viewer?.data?.Viewer) {
       this.userLists.value = this.getUserLists({ sort: 'list_updated_at' })
+      this.userLists.value.then(() => {
+        if (status.value !== 'offline' && this.mutationQueue.hasPending) return this.#flushMutationQueue()
+      }).catch(error => debug('Failed to load user lists or replay mutations on init:', error))
       //  update userLists every 15 mins
       setInterval(async () => {
         this.getUserLists({ sort: 'list_updated_at' }).then(updatedLists => {
           this.userLists.value = Promise.resolve(updatedLists) // no need to have userLists await the entire query process while we already have previous values, (it's awful to wait 15+ seconds for the query to succeed with large lists)
+          if (status.value !== 'offline' && this.mutationQueue.hasPending) return this.#flushMutationQueue()
         }).catch(error => debug('Failed to update user lists at the scheduled interval, this is likely a temporary connection issue:', error))
       }, 1_000 * 60 * 15)
       // update userLists and flush queued offline mutations when back online
       uniqueStore(status).subscribe(value => {
-        if (value !== 'online') return
+        if (!(previousStatus.value.match(/offline/i) && value === 'online')) return
         debug(`Back online${this.mutationQueue.hasPending ? ' with pending mutations' : ''}, refreshing user lists`)
         this.getUserLists({ sort: 'list_updated_at' }).then(updatedLists => {
           this.userLists.value = Promise.resolve(updatedLists)
-          if (this.mutationQueue.hasPending) this.#flushMutationQueue()
+          if (this.mutationQueue.hasPending) return this.#flushMutationQueue()
         }).catch(error => debug('Failed to refresh user lists after coming online:', error))
       })
     } else {
+      if (status.value !== 'offline' && this.mutationQueue.hasPending) {
+        this.#flushMutationQueue().catch(error => debug('Failed to replay mutations on init:', error))
+      }
       uniqueStore(status).subscribe(value => {
-        if (value !== 'online' || !this.mutationQueue.hasPending) return
+        if (!(previousStatus.value.match(/offline/i) && value === 'online') || !this.mutationQueue.hasPending) return
         debug('Back online with pending mutations, flushing mutation queue...')
-        this.#flushMutationQueue()
+        this.#flushMutationQueue().catch(error => debug('Failed to replay mutations after coming online:', error))
       })
     }
   }
@@ -130,7 +139,7 @@ class MALClient {
    */
   handleRequest = this.limiter.wrap(async (query, options) => {
     await this.rateLimitPromise
-    trace(`[${this.numberOfQueries}] requesting`, `query: ${JSON.stringify({ ...query, token: query.token ? '[redacted]' : undefined })}`, `options: ${JSON.stringify({ ...options, headers: { ...options.headers, Authorization: options.headers?.Authorization ? '[redacted]' : undefined } })}`)
+    trace(`[${this.numberOfQueries}] requesting`, `query: ${JSON.stringify({ ...query, token: query.token ? '[redacted]' : undefined, eToken: query.eToken ? '[redacted]' : undefined })}`, `options: ${JSON.stringify({ ...options, headers: { ...options.headers, Authorization: options.headers?.Authorization ? '[redacted]' : undefined } })}`)
     this.numberOfQueries++
     let res = {}
     if (!query.eToken && (this.failedRefresh.includes(query.token ? query.token : this.userID.token) || (!query.token && this.userID.reauth))) return {}
@@ -151,6 +160,7 @@ class MALClient {
     if (!res?.ok && (res?.status === 429 || res?.status === 500)) {
       throw res
     }
+    if (res?.ok && query.type === 'DELETE') return true
     let json = null
     try {
       json = await res.json()
@@ -160,13 +170,12 @@ class MALClient {
     if (!res?.ok && res?.status !== 404) {
       if (json) {
         for (const error of json?.errors || [json?.error] || []) {
-          let code = error
+          let code
           switch (error) {
             case 'forbidden':
               code = 403
               break
-            case 'invalid_token':
-              code = 401
+            case 'invalid_token': { // 401
               const oauth = await this.refreshToken(query)
               if (oauth) {
                 options.headers = {
@@ -175,6 +184,7 @@ class MALClient {
                 }
                 return this.handleRequest(query, options)
               } else return {}
+            }
             case 'invalid_content':
               code = 422
               break
@@ -187,6 +197,7 @@ class MALClient {
         printError('Search Failed', 'Failed making request to MyAnimeList! Try again in a minute.', res)
       }
     }
+    if (query.type !== 'GET' && !res?.ok) return null
     return json
   })
 
@@ -205,7 +216,9 @@ class MALClient {
   async malEntry (media, variables) {
     variables.idMal = media.idMal
     const res = await this.entry(variables)
-    if (!variables.token) mediaCache.value[media.id].mediaListEntry = res?.data?.SaveMediaListEntry
+    if (!variables.token && res?.data?.SaveMediaListEntry) {
+      mediaCache.update(medias => ({ ...medias, [media.id]: { ...(medias[media.id] || media), mediaListEntry: res.data.SaveMediaListEntry } }))
+    }
     return res
   }
 
@@ -230,6 +243,7 @@ class MALClient {
         path: `users/@me/animelist?fields=${queryFields}&nsfw=true&limit=${limit}&offset=${offset}&sort=${variables.sort}`
       }
       const res = await this.malRequest(query)
+      if (res?.error || res?.errors?.length || !Array.isArray(res?.data)) throw new Error('Failed to fetch MyAnimeList user lists')
       allMediaList = res?.data ? allMediaList.concat(res.data) : []
 
       if ((res?.data?.length < limit) || !res?.data) {
@@ -323,17 +337,23 @@ class MALClient {
         }
       }
     }
-    if (status.value.match(/offline/i) && settings.value.offlineSync) {
+    if (status.value === 'offline' && settings.value.offlineSync) {
       debug(`We are offline and offline syncing is enabled, queuing entry update for media ${variables.idMal}`)
-      this.mutationQueue.enqueue('entry', variables.idMal, variables, null, this.mutationQueue.getProgressBefore(variables.idMal) ?? variables.episode ?? null, false)
+      this.mutationQueue.enqueue('entry', variables.idMal, variables, null, this.mutationQueue.getProgressBefore(variables.idMal, variables) ?? variables.episode ?? null, false)
       return entryData
     }
     const result = this.#listPromise.then(async () => {
       const res = await this.malRequest(query, updateData)
-      setTimeout(async () => {
-        if (!variables.token) this.userLists.value = Promise.resolve(await this.getUserLists({ sort: 'list_updated_at' }, true)) // awaits before setting the value as it is super jarring to have stuff constantly re-rendering when it's not needed.
+      if (res?.error || res?.errors?.length || typeof res?.status !== 'string') return
+      if (Number.isFinite(res.num_episodes_watched)) entryData.data.SaveMediaListEntry.progress = res.num_episodes_watched
+      setTimeout(() => {
+        if (!variables.token) {
+          this.getUserLists({ sort: 'list_updated_at' }, true).then(updatedLists => {
+            this.userLists.value = Promise.resolve(updatedLists) // awaits before setting the value as it is super jarring to have stuff constantly re-rendering when it's not needed.
+          }).catch(error => debug('Failed to refresh user lists after entry update:', error))
+        }
       }).unref?.()
-      return res ? entryData : res
+      return entryData
     })
     this.#listPromise = result.catch(() => {})
     return await result
@@ -342,7 +362,7 @@ class MALClient {
   async delete (variables) {
     debug(`Deleting entry for ${variables.idMal}`)
 
-    if (status.value.match(/offline/i) && settings.value.offlineSync) {
+    if (status.value === 'offline' && settings.value.offlineSync) {
       debug(`We are offline and offline syncing is enabled, queuing entry deletion for media ${variables.idMal}`)
       this.mutationQueue.enqueue('delete', variables.idMal, variables, null, null, false)
       return []
@@ -356,10 +376,15 @@ class MALClient {
     }
     const result = this.#listPromise.then(async () => {
       const res = await this.malRequest(query)
-      setTimeout(async () => {
-        if (!variables.token) this.userLists.value = Promise.resolve(await this.getUserLists({ sort: 'list_updated_at' }, true)) // awaits before setting the value as it is super jarring to have stuff constantly re-rendering when it's not needed.
+      if (res !== true) return
+      setTimeout(() => {
+        if (!variables.token) {
+          this.getUserLists({ sort: 'list_updated_at' }, true).then(updatedLists => {
+            this.userLists.value = Promise.resolve(updatedLists) // awaits before setting the value as it is super jarring to have stuff constantly re-rendering when it's not needed.
+          }).catch(error => debug('Failed to refresh user lists after entry deletion:', error))
+        }
       }).unref?.()
-      return res
+      return []
     })
     this.#listPromise = result.catch(() => {})
     return await result
@@ -370,15 +395,28 @@ class MALClient {
    * MAL has no isFetchingList race condition so there are never any executed mutations to re-apply, only offline ones to execute.
    */
   async #flushMutationQueue() {
-    const lists = (await this.userLists.value)?.data?.MediaList ?? null
-    await this.mutationQueue.flush(
-      lists,
-      async () => {}, // no executed mutations for MAL
-      async (mutation) => {
-        if (mutation.type === 'entry') await this.entry(mutation.variables)
-        else if (mutation.type === 'delete') await this.delete(mutation.variables)
-      }
-    )
+    if (this.#isFlushingMutations) return
+    this.#isFlushingMutations = true
+    try {
+      const lists = (await this.userLists.value)?.data?.MediaList ?? null
+      await this.mutationQueue.flush(
+        lists,
+        async () => {}, // no executed mutations for MAL
+        async (mutation) => {
+          if (status.value === 'offline') throw new Error('Cannot replay MyAnimeList mutations while offline')
+          if (mutation.type === 'entry') {
+            const res = await this.entry(mutation.variables)
+            if (!res?.data?.SaveMediaListEntry) throw new Error('MyAnimeList entry update failed')
+            return res.data.SaveMediaListEntry
+          } else if (mutation.type === 'delete') {
+            const res = await this.delete(mutation.variables)
+            if (!res) throw new Error('MyAnimeList entry deletion failed')
+          }
+        }
+      )
+    } finally {
+      this.#isFlushingMutations = false
+    }
   }
 }
 

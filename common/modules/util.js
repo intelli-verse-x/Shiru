@@ -32,7 +32,9 @@ export const codes = {
   521: 'Web Server Is Down'
 }
 
-export const equalsIgnoreCase = (a, b) => a?.toLowerCase() === b?.toLowerCase()
+export const stripRootFolder = path => path.replaceAll('\\', '/').replace(/^[^/]+\//, '')
+
+export const equalsIgnoreCase = (a, b) => a != null && b != null && (typeof a === 'string' && typeof b === 'string' ? a.toLowerCase() === b.toLowerCase() : a === b)
 
 /**
  * Returns a deterministic avatar filename based on the provided seed text.
@@ -106,9 +108,17 @@ export function createDeferred() {
 /** Reactive root font size in pixels, updates when the document font size changes. */
 export const baseFontSize = (() => {
   const store = writable(typeof getComputedStyle !== 'undefined' ? parseFloat(getComputedStyle(document.documentElement).fontSize) : 16)
+  const update = () => {
+    const fontSize = parseFloat(getComputedStyle(document.documentElement).fontSize)
+    if (Number.isFinite(fontSize)) store.value = fontSize
+  }
   if (typeof ResizeObserver !== 'undefined') {
-    const observer = new ResizeObserver(() => store.value = parseFloat(getComputedStyle(document.documentElement).fontSize))
+    const observer = new ResizeObserver(update)
     observer.observe(document.documentElement)
+  }
+  if (typeof MutationObserver !== 'undefined') {
+    const observer = new MutationObserver(update)
+    observer.observe(document.documentElement, { attributes: true })
   }
   return store
 })()
@@ -215,8 +225,7 @@ export function since (date) {
 export function eta(date) {
   const secondsElapsed = (date.getTime() - Date.now()) / 1000
   if (!isFinite(secondsElapsed)) return '∞'
-  for (const key in ranges) {
-    const seconds = ranges[key]
+  for (const [key, seconds] of Object.entries(ranges)) {
     if (Math.abs(secondsElapsed) >= seconds) {
       const delta = secondsElapsed / seconds
       return formatterShort.format(Math.round(delta), key)
@@ -391,10 +400,13 @@ function replaceSeasonWithWords(text) {
 }
 
 const hyphenRegex = /(\w)-(\w)/g
-const regex = !SUPPORTS.isAndroid ? new RegExp('[^\\p{L}\\p{N}\\p{Zs}\\p{Pd}]', 'gu') : /[^a-zA-Z0-9\s\-\u00C0-\u024F\u0400-\u04FF\u0370-\u03FF\u0600-\u06FF\u0900-\u097F\u4E00-\u9FFF]/g
+// eslint-disable-next-line prefer-regex-literals
+const regex = !SUPPORTS.isAndroid ? new RegExp('[^\\p{L}\\p{N}\\p{Zs}\\p{Pd}]', 'gu')
+  // eslint-disable-next-line no-misleading-character-class
+  : /[^a-zA-Z0-9\s\-\u00C0-\u024F\u0400-\u04FF\u0370-\u03FF\u0600-\u06FF\u0900-\u097F\u4E00-\u9FFF]/g
 function cleanText(text) {
   if (typeof text !== 'string') return ''
-  return replaceSeasonWithWords(text.replace(hyphenRegex, '$1 $2').replace(regex, ''))
+  return replaceSeasonWithWords(text.replace(hyphenRegex, '$1 $2').replace(regex, character => character === '&' ? character : ''))
 }
 
 /**
@@ -417,7 +429,9 @@ export function matchKeys(nest, phrase, keys, threshold = 0.4) {
       if (cleanedArray.length) setNestedValue(cleanedNest, key, cleanedArray)
     }
   }
-  if (new Fuse([cleanedNest], { includeScore: true, threshold, keys: keys }).search(cleanedPhrase).length > 0) return true
+  const phrases = [...new Set([cleanedPhrase, cleanedPhrase.replace(/\band\b/gi, '&'), cleanedPhrase.replace(/&/g, 'and')])]
+  const titleSearch = new Fuse([cleanedNest], { includeScore: true, threshold, keys: keys })
+  if (phrases.some(phrase => titleSearch.search(phrase).length > 0)) return true
   const fuse = new Fuse([cleanedPhrase], { includeScore: true, threshold })
   return keys.some((key) => {
     const valueToMatch = cleanedNest[key]
@@ -441,7 +455,7 @@ export function matchPhrase(search, phrase, threshold, strict = false, soft = fa
   if (!search || !phrase) return false
   const normalizedSearch = search.toString().toLowerCase().replace(regex, '')
   phrase = Array.isArray(phrase) ? phrase : [phrase]
-  for (let p of phrase) {
+  for (const p of phrase) {
     if (p) {
       const normalizedPhrase = p.toLowerCase().replace(regex, '')
       if (strict) {
@@ -450,7 +464,7 @@ export function matchPhrase(search, phrase, threshold, strict = false, soft = fa
         if (normalizedSearch.includes(normalizedPhrase)) return true
         const searchWords = normalizedSearch.split(/\s+/)
         if (!soft) {
-          for (let word of searchWords) {
+          for (const word of searchWords) {
             if (levenshtein(word, normalizedPhrase) <= threshold) return true
           }
         } else return new Fuse([normalizedPhrase], { includeScore: true, threshold, ignoreLocation: true, useExtendedSearch: true, isCaseSensitive: false }).search(normalizedSearch)?.length > 0
@@ -562,6 +576,81 @@ export function fadeOut(node, { delay = 0, duration = 200, y = 1.2, endScale = 0
 }
 
 /**
+ * Horizontally shifts an element just enough to keep it inside the viewport.
+ * The individual translate property intentionally stays separate from transition transforms.
+ *
+ * @param {HTMLElement} node The element to keep visible.
+ * @param {number} [padding=0] Minimum distance from the viewport edge in pixels.
+ * @returns {{ destroy: () => void }} Svelte action lifecycle methods.
+ */
+export function clampToViewport(node, padding = 0) {
+  let frame
+  let scrollTimeout
+  let transitionTimeout
+  let shift = 0
+  const scrollContainer = node.closest('.gallery')
+  const originalTransition = {
+    value: node.style.getPropertyValue('transition'),
+    priority: node.style.getPropertyPriority('transition')
+  }
+
+  function restoreTransition() {
+    if (originalTransition.value) node.style.setProperty('transition', originalTransition.value, originalTransition.priority)
+    else node.style.removeProperty('transition')
+  }
+
+  function update() {
+    cancelAnimationFrame(frame)
+    frame = requestAnimationFrame(() => {
+      const rect = node.getBoundingClientRect()
+      const containerRect = scrollContainer?.getBoundingClientRect()
+      const leftEdge = Math.max(padding, (containerRect?.left ?? 0) + padding)
+      const rightEdge = Math.min(window.innerWidth - padding, (containerRect?.right ?? window.innerWidth) - padding)
+      const baseCenter = ((rect.left + rect.right) / 2) - shift
+      const baseLeft = baseCenter - (node.offsetWidth / 2)
+      const baseRight = baseCenter + (node.offsetWidth / 2)
+
+      if (node.offsetWidth > rightEdge - leftEdge || baseLeft < leftEdge) shift = leftEdge - baseLeft
+      else if (baseRight > rightEdge) shift = rightEdge - baseRight
+      else shift = 0
+
+      node.style.translate = `${shift}px 0`
+    })
+  }
+
+  function handleScroll() {
+    clearTimeout(scrollTimeout)
+    clearTimeout(transitionTimeout)
+    restoreTransition()
+    scrollTimeout = setTimeout(() => {
+      node.style.setProperty('transition', 'translate 120ms ease-out')
+      update()
+      transitionTimeout = setTimeout(restoreTransition, 180)
+      transitionTimeout.unref?.()
+    }, 120)
+    scrollTimeout.unref?.()
+  }
+
+  const resizeObserver = new ResizeObserver(update)
+  resizeObserver.observe(node)
+  window.addEventListener('resize', update)
+  scrollContainer?.addEventListener('scroll', handleScroll, { passive: true })
+  update()
+
+  return {
+    destroy() {
+      cancelAnimationFrame(frame)
+      clearTimeout(scrollTimeout)
+      clearTimeout(transitionTimeout)
+      restoreTransition()
+      resizeObserver.disconnect()
+      window.removeEventListener('resize', update)
+      scrollContainer?.removeEventListener('scroll', handleScroll)
+    }
+  }
+}
+
+/**
  * General work-around for preventing the reactive animations for specific classes when they are not needed.
  * Importing this and adding {$reactive ? `` : `not-reactive`} will disable reactivity for the added element when a trigger class is clicked.
  *
@@ -648,6 +737,7 @@ export const defaults = {
   playerAutocomplete: true,
   playerAutocompleteThreshold: 85,
   playerDeband: false,
+  playerTorrentStats: true,
   preferDubs: false,
   adult: 'none',
   hentaiBanner: false,
@@ -656,9 +746,11 @@ export const defaults = {
   rssQuality: '1080',
   rssFeedsNew: [],
   rssNotify: ['CURRENT', 'PLANNING'],
+  rssNotifyDisabled: {},
   systemNotify: true,
   aniNotify: 'all',
   releasesNotify: [],
+  releasesNotifyDisabled: {},
   subAnnounce: 'none',
   dubAnnounce: 'none',
   hentaiAnnounce: 'none',
@@ -672,6 +764,7 @@ export const defaults = {
   disableStartupTorrent: SUPPORTS.isAndroid,
   torrentPort: 0,
   torrentStreamedDownload: true,
+  stageImportedTorrents: false,
   torrentSort: 'seeders',
   seedingLimit: !SUPPORTS.isAndroid ? 5 : 2,
   dhtPort: 0,
@@ -706,6 +799,7 @@ export const defaults = {
   disableMiniplayer: false,
   autoHideMiniplayer: true,
   enableExternal: false,
+  autoFullscreen: true,
   spoilers: 'off',
   spoilerStatus: [],
   playerPath: '',
@@ -732,6 +826,33 @@ export const defaults = {
     atob('d3NzOi8vdHJhY2tlci5maWxlcy5mbTo3MDczL2Fubm91bmNl'),
     atob('d3NzOi8vdHJhY2tlci5idG9ycmVudC54eXov')
   ]
+}
+
+/**
+ * @param {typeof defaults} value
+ * @param {string|number} userID
+ * @param {string} debug
+ * @returns {object}
+ */
+export function getTorrentSettings(value, userID, debug) {
+  return {
+    userID,
+    dht: !value.torrentDHT,
+    torrentUTP: !value.torrentUTP,
+    torrentPeX: !value.torrentPeX,
+    maxConns: value.maxConns,
+    downloadLimit: (value.torrentSpeed * 1048576) || 0,
+    uploadLimit: (value.torrentSpeed * 1048576) || 0,
+    torrentPort: value.torrentPort || 0,
+    dhtPort: value.dhtPort || 0,
+    torrentPersist: value.torrentPersist,
+    torrentStreamedDownload: value.torrentStreamedDownload,
+    torrentPathNew: value.torrentPathNew,
+    playerPath: value.playerPath,
+    seedingLimit: value.seedingLimit,
+    trackers: value.trackers,
+    debug
+  }
 }
 
 /**
@@ -767,7 +888,6 @@ export const generalDefaults = {
  * @property {any} [lastSubtitle]
  * @property {any} [lastSearched]
  * @property {any} [lastSchedule]
- * @property {any} [animeResolvedHash]
  * @property {any} [animeEpisodeProgress]
  */
 export const historyDefaults = {
@@ -776,7 +896,6 @@ export const historyDefaults = {
   lastSubtitle: undefined,
   lastSearched: undefined,
   lastSchedule: undefined,
-  animeResolvedHash: [],
   animeEpisodeProgress: []
 }
 
