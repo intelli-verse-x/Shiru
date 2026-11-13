@@ -6,7 +6,7 @@ import { youtubeServer } from './youtube.js'
 import { BrowserWindow, MessageChannelMain, Notification, Tray, Menu, nativeImage, app, dialog, ipcMain, powerMonitor, shell, session } from 'electron'
 import electronShutdownHandler from '@paymoapp/electron-shutdown-handler'
 
-import { development, timeouts, getImage, getWindowState, saveWindowState, getDefaultBounds, toXmlString } from './util.js'
+import { development, windowBounds, timeouts, getImage, getWindowState, saveWindowState, getDefaultBounds, toXmlString } from './util.js'
 import Debug from './debugger.js'
 import Discord from './discord.js'
 import Protocol from './protocol.js'
@@ -29,8 +29,8 @@ export default class App {
   windowState = getWindowState()
   mainWindow = new BrowserWindow({
     ...this.windowState.bounds,
-    minWidth: 320,
-    minHeight: 390,
+    minWidth: windowBounds.minWidth,
+    minHeight: windowBounds.minHeight,
     frame: process.platform === 'darwin',
     titleBarStyle: 'hidden',
     ...(process.platform !== 'darwin' ? { titleBarOverlay: {
@@ -69,12 +69,31 @@ export default class App {
     ipcMain.handle('common:isWindowVisible', () => this.mainWindow.isVisible())
     ipcMain.on('electron:openTorrentDevTools', () => this.webtorrentWindow.webContents.openDevTools({ mode: 'detach' }))
     ipcMain.on('electron:openDevTools', ({ sender }) => sender.openDevTools({ mode: 'detach' }))
+    ipcMain.on('electron:showTextContextMenu', ({ sender }, { editable, textField, hasSelection, canUndo, canRedo }) => {
+      Menu.buildFromTemplate(editable ? [
+        { role: 'undo', enabled: canUndo },
+        { role: 'redo', enabled: canRedo },
+        { type: 'separator' },
+        { role: 'cut', enabled: hasSelection },
+        { role: 'copy', enabled: hasSelection },
+        { role: 'paste' },
+        { role: 'delete', enabled: hasSelection },
+        { type: 'separator' },
+        { role: 'selectAll' }
+      ] : [
+        { role: 'copy', enabled: hasSelection },
+        textField ? { role: 'selectAll' } : { label: 'Select All', click: () => sender.send('electron:onSelectContextText') }
+      ]).popup({ window: this.mainWindow })
+    })
     ipcMain.on('electron:hideWindow', () => this.mainWindow.hide())
     ipcMain.on('electron:showAndFocus', () => this.showAndFocus())
     ipcMain.on('minimize', () => this.mainWindow?.minimize())
     ipcMain.on('maximize', () => this.mainWindow?.isMaximized() ? this.mainWindow.unmaximize() : this.mainWindow.maximize())
-    ipcMain.on('webtorrent-restart', () => this.setWebTorrentWindow(true))
-    this.mainWindow.on('maximize', () => this.mainWindow.webContents.send('isMaximized', true))
+    ipcMain.on('torrent:restart', () => this.setWebTorrentWindow(true))
+    this.mainWindow.on('maximize', () => {
+      saveWindowState(this.mainWindow)
+      this.mainWindow.webContents.send('isMaximized', true)
+    })
     this.mainWindow.on('unmaximize', () => {
       saveWindowState(this.mainWindow)
       this.mainWindow.webContents.send('isMaximized', false)
@@ -100,8 +119,14 @@ export default class App {
       this.mainWindow.webContents.send('electron:onFullScreen', isFullScreen)
     }
     ipcMain.handle('electron:isFullScreen', () => this.isFullScreen)
-    this.mainWindow.on('enter-full-screen', () => fullScreen(true))
-    this.mainWindow.on('leave-full-screen', () => fullScreen(false))
+    this.mainWindow.on('enter-full-screen', () => {
+      fullScreen(true)
+      debounceState()
+    })
+    this.mainWindow.on('leave-full-screen', () => {
+      fullScreen(false)
+      debounceState()
+    })
 
     this.setWebTorrentWindow()
 
@@ -171,7 +196,11 @@ export default class App {
 
     this.mainWindow.loadURL(development ? 'http://localhost:5000/app.html' : `file://${join(__dirname, '/app.html')}`)
 
-    if (development) this.mainWindow.webContents.once('did-finish-load', () => this.mainWindow.webContents.openDevTools({ mode: 'detach' }))
+    if (development) {
+      this.mainWindow.webContents.once('did-finish-load', () => {
+        if (!this.destroyed && !this.mainWindow.isDestroyed()) this.mainWindow.webContents.openDevTools({ mode: 'detach' })
+      })
+    }
 
     let crashcount = 0
     this.mainWindow.webContents.on('render-process-gone', async (e, { reason }) => {
@@ -186,23 +215,46 @@ export default class App {
       }
     })
 
-    ipcMain.handle('torrent:portRequest', async (event, settings) => {
-      const { port1, port2 } = new MessageChannelMain()
+    ipcMain.handle('torrent:portRequest', async (event, { settings, requestId }) => {
       this.torrentAlive = false
       await this.torrentLoad
-      return new Promise(resolve => {
-        ipcMain.once('webtorrent-heartbeat', () => {
-          this.webtorrentWindow.webContents.postMessage('main-heartbeat', settings)
-          ipcMain.once('torrentRequest', () => {
-            this.webtorrentWindow.webContents.postMessage('torrent:port', null, [port1])
-            event.sender.postMessage('electron:torrentPort', null, [port2])
+      const worker = this.webtorrentWindow?.webContents
+      if (this.destroyed || !worker || worker.isDestroyed()) throw new Error('Torrent worker is unavailable')
+      const { port1, port2 } = new MessageChannelMain()
+      return new Promise((resolve, reject) => {
+        const finish = error => {
+          clearTimeout(timer)
+          ipcMain.removeListener('torrent:ready', onReady)
+          ipcMain.removeListener('torrent:init-error', onError)
+          if (error) {
+            port1.close()
+            port2.close()
+            reject(error)
+          } else resolve()
+        }
+        const onReady = (reply, id) => {
+          if (reply.sender !== worker || id !== requestId) return
+          try {
+            if (this.destroyed || worker.isDestroyed() || event.sender.isDestroyed()) throw new Error('Torrent connection closed')
+            worker.postMessage('torrent:port', null, [port1])
+            event.sender.postMessage('torrent:port', { requestId }, [port2])
             this.torrentAlive = true
-            resolve()
-          })
-        })
+            finish()
+          } catch (error) { finish(error) }
+        }
+        const onError = (reply, id, message) => {
+          if (reply.sender === worker && id === requestId) finish(new Error(message))
+        }
+        const timer = setTimeout(() => finish(new Error('Torrent initialization timed out')), 15_000)
+        ipcMain.on('torrent:ready', onReady)
+        ipcMain.on('torrent:init-error', onError)
+        try { worker.postMessage('torrent:init', { settings, requestId }) } catch (error) { finish(error) }
       })
     })
-    ipcMain.on('torrent:reload', () => { if (!this.mainWindow?.isDestroyed() && !this.webtorrentWindow?.isDestroyed()) this.webtorrentWindow.webContents.postMessage('torrent:reload', null) })
+    ipcMain.on('torrent:reload', () => {
+      if (this.destroyed || this.mainWindow?.isDestroyed() || this.webtorrentWindow?.isDestroyed()) return
+      this.webtorrentWindow.webContents.postMessage('torrent:reload', null)
+    })
 
     let authWindow
     ipcMain.handle('common:linkAccount', (event, url) => {
@@ -231,8 +283,7 @@ export default class App {
         })
         authWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
         authWindow.webContents.on('did-finish-load', () => authWindow.show())
-        authWindow.webContents.on('did-start-loading', () => authWindow.webContents.insertCSS
-          (`
+        authWindow.webContents.on('did-start-loading', () => authWindow.webContents.insertCSS(`
             ::-webkit-scrollbar {
               width: 6px;
               height: 6px;
@@ -301,7 +352,11 @@ export default class App {
         this.webtorrentWindow = this.makeWebTorrentWindow()
       }
       this.torrentLoad = this.webtorrentWindow.loadURL(development ? 'http://localhost:5000/background.html' : `file://${join(__dirname, '/background.html')}`)
-      if (development) this.webtorrentWindow.webContents.once('did-finish-load', () => this.webtorrentWindow.webContents.openDevTools({ mode: 'detach' }))
+      if (development) {
+        this.webtorrentWindow.webContents.once('did-finish-load', () => {
+          if (!this.destroyed && !this.mainWindow.isDestroyed() && !this.webtorrentWindow.isDestroyed()) this.webtorrentWindow.webContents.openDevTools({ mode: 'detach' })
+        })
+      }
       if (crashed) this.mainWindow.webContents.send('torrent:onCrash')
       this.webtorrentWindow.on('closed', () => this.destroy())
       this.webtorrentWindow.webContents.on('render-process-gone', async (e, { reason }) => {
@@ -314,24 +369,38 @@ export default class App {
   async destroy(forceRunAfter = false) {
     if (this.destroyed) return
     this.destroyed = true
-    this.updater.destroyed = true
+    this.updater.destroy()
     this.exit = true
-    this.mainWindow.hide()
-    this.mainWindow.webContents?.closeDevTools?.()
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      clearTimeout(this.stateTimeout)
+      saveWindowState(this.mainWindow)
+      this.mainWindow.hide()
+      this.mainWindow.webContents?.closeDevTools?.()
+    }
     this.tray?.destroy()
     for (const timeout of timeouts) clearTimeout(timeout)
     timeouts.clear()
-    clearTimeout(this.stateTimeout)
-    saveWindowState(this.mainWindow)
     youtubeServer?.close?.()
+    try {
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        let flushTimeout
+        await new Promise(resolve => {
+          ipcMain.once('electron:cacheFlushed', resolve)
+          flushTimeout = setTimeout(resolve, 5_000)
+          flushTimeout.unref?.()
+          this.mainWindow.webContents.send('electron:onFlushCache')
+        })
+        clearTimeout(flushTimeout)
+      }
+    } catch {} // The renderer may already be gone during a forced shutdown.
     try {
       if (this.webtorrentWindow && !this.webtorrentWindow.isDestroyed()) { // WebTorrent shouldn't ever be destroyed before main, but it's better to be safe.
         this.webtorrentWindow.webContents?.closeDevTools?.()
-        this.webtorrentWindow.webContents?.postMessage('destroy', null)
+        this.webtorrentWindow.webContents?.postMessage('torrent:destroy', null)
         if (this.torrentAlive) { // If the app hasn't fully started there may be no response from WebTorrent and no data to save, best to not wait.
           let resolveTimeout
           await new Promise(resolve => {
-            ipcMain.once('destroyed', resolve)
+            ipcMain.once('torrent:destroyed', resolve)
             resolveTimeout = setTimeout(resolve, 5_000)
             resolveTimeout.unref?.()
           })
@@ -382,27 +451,34 @@ export default class App {
   restoreWindow() {
     if (this.destroyed || this.mainWindow?.isDestroyed()) return
     const defaultBounds = getDefaultBounds()
-    this.mainWindow.unmaximize()
-    this.mainWindow.setFullScreen(false)
-    this.mainWindow.setBounds(defaultBounds)
-    /** HACK: Electron doesn't handle DPI scaling differences between monitors very well so we have to set the bounds twice... */
-    setImmediate(() => {
+    const resetBounds = () => {
+      if (this.destroyed || this.mainWindow.isDestroyed()) return
+      this.mainWindow.unmaximize()
       this.mainWindow.setBounds(defaultBounds)
-      saveWindowState(this.mainWindow)
-      this.showAndFocus()
-    })
+      /** HACK: Electron doesn't handle DPI scaling differences between monitors very well so we have to set the bounds twice... */
+      setImmediate(() => {
+        if (this.destroyed || this.mainWindow.isDestroyed()) return
+        this.mainWindow.setBounds(defaultBounds)
+        saveWindowState(this.mainWindow)
+        this.showAndFocus()
+      })
+    }
+    if (this.mainWindow.isFullScreen()) {
+      this.mainWindow.once('leave-full-screen', resetBounds)
+      this.mainWindow.setFullScreen(false)
+    } else resetBounds()
   }
 
   showAndFocus(ready = false) {
-    if (!this.ready && !ready) return
+    if ((!this.ready && !ready) || this.destroyed) return
+    const firstShow = !this.ready
     if (!this.ready) {
       this.ready = true
       this.setTrayMenu()
     }
-    if (ready) {
-      if (this.windowState.bounds.x && this.windowState.bounds.y) this.mainWindow.setBounds(this.windowState.bounds)
+    if (ready && firstShow) {
+      this.mainWindow.setBounds(this.windowState.bounds)
       if (this.windowState.isMaximized) this.mainWindow.maximize()
-      if (this.windowState.isFullScreen) this.mainWindow.setFullScreen(true)
     }
     if (this.mainWindow.isMinimized()) {
       this.mainWindow.restore()

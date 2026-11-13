@@ -1,64 +1,67 @@
 <script>
-  import { goBack, goForward, canGoBack, canGoForward } from '@/modules/navigation.js'
+  import { goBack, goForward, canGoBack, canGoForward, drawerOpen, page } from '@/modules/navigation.js'
   import NavItem from '@/components/navigation/components/NavItem.svelte'
   import NavLink from '@/components/navigation/components/NavLink.svelte'
   import NavBar from '@/components/navigation/components/NavBar.svelte'
-  import { page, drawerOpen } from '@/modules/navigation.js'
+  import { status, previousStatus } from '@/modules/networking.js'
   import { ELECTRON, COMMON } from '@/modules/bridge.js'
   import { fadeIn, fadeOut } from '@/modules/util.js'
-  import { MoveLeft, MoveRight } from 'lucide-svelte'
+  import { ChevronLeft, ChevronRight } from 'lucide-svelte'
   import { settings } from '@/modules/settings.js'
-  import { status } from '@/modules/networking.js'
   import { click } from '@/modules/lib/click.js'
   import { writable } from 'simple-store-svelte'
+  import { onDestroy } from 'svelte'
 
   /** @type {import('simple-store-svelte').Writable<string[]>} */
   const drawerItems = writable([])
 
   /**
-   * Previous network status value used to detect changes
-   *
-   * @type {string}
-   */
-  let _status = status.value
-  /**
    * Whether a status transition animation is active
    *
    * @type {boolean}
    */
-  $: statusTransition = false
-  $: {
-    if (_status !== $status) {
+  let statusTransition = false
+  /** @type {ReturnType<typeof setTimeout>} */
+  let transitionTimeout
+  /** @type {() => void} */
+  const unsubscribeStatus = status.subscribe(value => {
+    if (previousStatus.value !== value) {
       statusTransition = true
-      setTimeout(() => (statusTransition = false), 3000)
-      _status = $status
+      clearTimeout(transitionTimeout)
+      transitionTimeout = setTimeout(() => (statusTransition = false), 3_000)
+      transitionTimeout.unref?.()
     }
-  }
+  })
 
   /** @type {boolean} */
   let fullScreen = false
   ELECTRON.isFullScreen().then(isFullScreen => {
     fullScreen = isFullScreen
-    ELECTRON.onFullScreen((isFullScreen) => fullScreen = isFullScreen)
+    ELECTRON.onFullScreen((isFullScreen) => (fullScreen = isFullScreen))
   })
 
   /** Closes the overflow drawer */
   function closeDrawer() {
     drawerOpen.set(false)
   }
+
+  onDestroy(() => {
+    clearTimeout(transitionTimeout)
+    unsubscribeStatus()
+  })
 </script>
 
 <div class='sidebar z-80 d-md-block' style='height: calc(100% - var(--safe-area-bottom)) !important' class:animated={$settings.expandingSidebar} class:open={$drawerOpen && $settings.expandingSidebar}>
   <div class='z--1 pointer-events-none h-full bg-dark position-absolute' style='width: var(--sidebar-width)'/>
   <div class='sidebar-overlay z--1 pointer-events-none h-full position-absolute' class:animated={$settings.expandingSidebar} />
   <div class='sidebar-menu h-full d-flex flex-column m-0 pb-5 animate' class:br-10={!$settings.expandingSidebar}>
-    <div class='w-50 top-0 flex-shrink-0 pointer-events-none {_status?.match(/offline/i) ? `h-25` : `${COMMON.getPlatformInfo().platform === `darwin` && !fullScreen ? `h-25` : `h-0`}`}' class:status-transition={statusTransition}/>
+    <div class='w-50 top-0 flex-shrink-0 pointer-events-none {$status !== 'online' ? `h-25` : `${COMMON.getPlatformInfo().platform === `darwin` && !fullScreen ? `h-25` : `h-0`}`}' class:status-transition={statusTransition}/>
     <div class='d-flex justify-content-center z-102' style='width: var(--sidebar-width); margin-top: 1rem !important'>
       <NavLink sidebar={true} center={false} click={goBack} class={`h-auto w-30 ${$canGoBack ? 'active' : ''}`} css='rounded-left-block p-0 m-0'>
-        <MoveLeft size={'2.5rem'} class='flex-shrink-0 rounded m-0' strokeWidth='2.5' />
+        <ChevronLeft size='2.5rem' class='flex-shrink-0 rounded m-0' strokeWidth='2.5' />
       </NavLink>
       <NavLink sidebar={true} center={false} click={goForward} class={`h-auto w-30 ${$canGoForward ? 'active' : ''}`} css='rounded-right-block p-0 m-0'>
-        <MoveRight size={'2.5rem'} class='flex-shrink-0 rounded m-0' strokeWidth='2.5' />
+        <ChevronRight size='2.5rem' class='flex-shrink-0 rounded m-0' strokeWidth='2.5' />
       </NavLink>
     </div>
     <div class='d-flex flex-column align-items-center' style='width: var(--sidebar-width)'>
@@ -73,7 +76,7 @@
   <div class='drawer-handle position-absolute pointer' tabindex='-1' class:d-none={$settings.expandingSidebar} use:click={closeDrawer} on:pointerdown={closeDrawer} />
   <div class='overflow-y-auto vh-60'>
     {#each $drawerItems as item (item)}
-      <NavItem {item} sidebar={true} size={'2.4rem'} drawer={true} {closeDrawer} />
+      <NavItem {item} sidebar={true} size='2.4rem' drawer={true} {closeDrawer} />
     {/each}
   </div>
 </div>

@@ -3,15 +3,14 @@ import { settings } from '@/modules/settings.js'
 import { status } from '@/modules/networking.js'
 import { cache, caches } from '@/modules/cache.js'
 import { toast } from '@/modules/lib/toast.js'
-import { add } from '@/modules/torrent.js'
-import { getEpisodeMetadataForMedia, isSubbedProgress } from '@/modules/anime/anime.js'
+import { add, getTorrentMedia, loadedTorrent, seedingTorrents, stagingTorrents, completedTorrents } from '@/modules/torrent.js'
+import { getEpisodeMetadataForMedia, isSubbedProgress, anitomyscript } from '@/modules/anime/anime.js'
 import AnimeResolver from '@/modules/anime/animeresolver.js'
 import { anilistClient } from '@/modules/providers/anilist/anilist.js'
 import { queueNotification } from '@/modules/notification/manager.js'
 import { hasNextPage } from '@/modules/sections.js'
 import { malDubs } from '@/modules/anime/animedubs.js'
 import { episodesList } from '@/modules/episodes.js'
-import { getId } from '@/modules/anime/animehash.js'
 import Debug from 'debug'
 const debug = Debug('ui:rss')
 
@@ -20,13 +19,13 @@ export function parseRSSNodes (nodes) {
     const pubDate = item.querySelector('pubDate')?.textContent
     const torrentLink = item.querySelector('enclosure')?.attributes.url.value || item.querySelector('link')?.textContent || '?'
     const title = item.querySelector('title')?.textContent || '?'
-    let tracker = torrentLink?.includes(atob('bnlhYQ==')) ? encodeURIComponent(atob('aHR0cDovL255YWEudHJhY2tlci53Zjo3Nzc3L2Fubm91bmNl')) : torrentLink?.includes(atob('c3VrZWJlaQ==')) ? encodeURIComponent(atob('aHR0cDovL3N1a2ViZWkudHJhY2tlci53Zjo4ODg4L2Fubm91bmNl')) : ''
+    const tracker = torrentLink?.includes(atob('bnlhYQ==')) ? encodeURIComponent(atob('aHR0cDovL255YWEudHJhY2tlci53Zjo3Nzc3L2Fubm91bmNl')) : torrentLink?.includes(atob('c3VrZWJlaQ==')) ? encodeURIComponent(atob('aHR0cDovL3N1a2ViZWkudHJhY2tlci53Zjo4ODg4L2Fubm91bmNl')) : ''
     let infoHash = item.querySelector('infoHash')?.textContent
     if (!infoHash) {
       try {
         const match = torrentLink.match(/\b([a-fA-F0-9]{40}|[A-Z2-7]{32})\b/)
         if (match) {
-          let foundHash = match[1].toLowerCase()
+          const foundHash = match[1].toLowerCase()
           if (foundHash.length === 32) infoHash = base32toHex(foundHash)
           else infoHash = foundHash
         }
@@ -47,7 +46,7 @@ export function parseRSSNodes (nodes) {
 }
 
 export async function getRSSContent (url) {
-  if (!url) return null
+  if (!url?.trim()) return null
   let res = {}
   try {
     res = await fetch(url)
@@ -112,7 +111,7 @@ class RSSMediaManager {
   async _getMediaForRSS (page, perPage, url, ignoreChanged = false, background = false) {
     debug(`Getting media for RSS feed ${url} page ${page} perPage ${perPage}`)
     const changed = await this.getContentChanged(page, perPage, url, ignoreChanged)
-    if (!changed) return this.resultMap[url].result
+    if (!changed) return this.resultMap[url]?.result || []
     debug(`Feed ${url} has changed, updating`)
 
     const index = (page - 1) * perPage
@@ -138,8 +137,8 @@ class RSSMediaManager {
     const newReleases = res.filter(({ date }) => date?.getTime() > oldDate)
     debug(`Found ${newReleases?.length} new releases, notifying...`)
     for (const { media, parseObject, episode, link, hash, date } of newReleases) {
-      const notify = (!media?.mediaListEntry && settings.value.rssNotify?.includes('NOTONLIST')) || (media?.mediaListEntry && settings.value.rssNotify?.includes(media?.mediaListEntry?.status))
-      const dubbed = await malDubs.isDubMedia(parseObject)
+      const dubbed = await malDubs.isDubMedia(parseObject, media)
+      const notify = !settings.value.rssNotifyDisabled?.[media?.mediaListEntry?.status || 'NOTONLIST']?.includes(dubbed ? 'Dub' : 'Sub') && ((!media?.mediaListEntry && settings.value.rssNotify?.includes('NOTONLIST')) || (media?.mediaListEntry && settings.value.rssNotify?.includes(media?.mediaListEntry?.status)))
       if (notify && (!settings.value.preferDubs || (media?.status === 'FINISHED' && !['CURRENT', 'REPEATING']?.includes(media?.mediaListEntry?.status)) || dubbed || !(await malDubs.isDubMedia(media)) || await isSubbedProgress(media))) {
         const highestEp = isValidNumber(episode) ? Number(episode) : Number(episodesList.handleArray(episode, episode)?.last)
         const progress = media?.mediaListEntry?.progress
@@ -177,22 +176,28 @@ class RSSMediaManager {
     let resolvedData = []
     const processedItems = items.map(item => {
       if (item.hash) {
-        const idData = getId(item.hash, {})
-        if (idData && idData.files?.length) {
+        const torrent = [loadedTorrent.value, ...seedingTorrents.value, ...stagingTorrents.value, ...completedTorrents.value].find(torrent => torrent.infoHash === item.hash.toLowerCase())
+        const idData = getTorrentMedia(torrent)
+        if (idData?.anilist_id && !idData.failed && idData.files?.length && idData.files.every(file => file.anilist_id === idData.anilist_id)) {
           return {
             fromId: true,
             original: item,
             ...idData,
-            media: cache.getMedia(idData.mediaId),
-            ...(!idData.parseObject && idData.files?.length ? { parseObject: idData.files[0].parseObject } : {}),
-            ...(!idData.episodeRange && idData.files?.length === 1 ? { episodeRange: idData.files[0].episodeRange || idData.files[0].parseObject?.episodeRange } : {}),
-            ...(!idData.episode && idData.files?.length === 1 ? { episode: idData.files[0].episode || idData.files[0].parseObject?.episode_number } : {}),
-            ...(!idData.season && idData.files?.length === 1 ? { season: idData.files[0].season || idData.files[0].parseObject?.anime_season } : {}),
-            ...(!idData.failed && idData.files?.length === 1 ? { failed: idData.files[0].failed || idData.files[0].parseObject?.failed } : {})
+            media: cache.getMedia(idData.anilist_id),
+            parseObject: { file_name: item.title, anime_title: item.title, episode_number: idData.episode, episodeRange: idData.episodeRange, anime_season: idData.files[0].season }
           }
         }
       }
       return { fromId: false, original: item }
+    })
+
+    const savedItems = processedItems.filter(item => item.fromId)
+    const parsedItems = savedItems.length ? await anitomyscript(savedItems.map(item => item.original.title)).catch(error => {
+      debug(error)
+      return []
+    }) : []
+    savedItems.forEach((item, index) => {
+      item.parseObject = { ...parsedItems[index], ...item.parseObject, anime_title: parsedItems[index]?.anime_title ?? item.original.title }
     })
 
     const unresolvedItems = processedItems.filter(item => !item.fromId).map(item => item.original.title)

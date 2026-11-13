@@ -1,45 +1,45 @@
+/** @returns {void} */
 const noopVoid = () => {}
+/** @returns {Promise<void>} */
 const noopAsyncVoid = async () => {}
+/** @returns {Promise<boolean>} */
 const noopAsyncBool = async () => false
+/** @returns {Promise<string>} */
+const noopAsyncArray = async () => []
+/** @returns {Promise<string>} */
 const noopAsyncString = async () => ''
+
+/** Safe fallback methods when the torrent preload is unavailable.
+ * @type {Window["torrent"]}
+ */
 const torrentDefaults = {
   reload: noopVoid,
   onCrash: noopVoid,
   onRequest: noopVoid,
-  debug: noopVoid,
+  debug: noopAsyncVoid,
+  /** @returns {Promise<{missingCount: number, removedCount: number}>} */
   rescan: async () => ({ missingCount: 0, removedCount: 0 }),
-  scrape: noopAsyncVoid,
-  stream: noopVoid,
-  stage: noopVoid,
-  complete: noopVoid,
-  unload: noopVoid,
-  untrack: noopVoid,
-  reannounce: noopVoid,
-  onStats: noopVoid,
-  onFiles: noopVoid,
-  onMagnet: noopVoid,
-  onTracks: noopVoid,
-  offTracks: noopVoid,
-  onSubtitles: noopVoid,
-  offSubtitles: noopVoid,
-  onChapters: noopVoid,
-  onProgress: noopVoid,
-  onCurrentStats: noopVoid,
-  onExternalReady: noopVoid,
-  onExternalWatched: noopVoid,
-  onAndroidExternal: noopVoid,
-  onLoaded: noopVoid,
-  onUntrack: noopVoid,
-  onStage: noopVoid,
-  onSeed: noopVoid,
-  onComplete: noopVoid,
-  onCompletedStats: noopVoid,
-  setPlayback: noopVoid,
-  restoreSession: noopVoid,
-  launchExternal: noopVoid,
-  updateNetwork: noopVoid,
-  updateSettings: noopVoid,
-  onNotify: noopVoid,
+  setMedia: async () => { throw new Error('Torrent cache is unavailable') },
+  scrape: noopAsyncArray,
+  stream: noopAsyncVoid,
+  stage: noopAsyncVoid,
+  complete: noopAsyncVoid,
+  unload: noopAsyncVoid,
+  untrack: noopAsyncVoid,
+  reannounce: noopAsyncVoid,
+  subscribe: noopAsyncVoid,
+  getTorrentStats: async () => null,
+  /** @returns {Promise<{total: number, free: number}>}  */
+  getDiskSpace: async () => ({ total: 0, free: 0 }),
+  getTracks: async () => null,
+  getChapters: async () => null,
+  onSubtitles: async () => null,
+  offSubtitles: noopAsyncVoid,
+  setPlayback: noopAsyncVoid,
+  restoreSession: noopAsyncArray,
+  launchExternal: noopAsyncVoid,
+  updateNetwork: noopAsyncVoid,
+  updateSettings: noopAsyncVoid,
   portRequest: noopAsyncVoid
 }
 const commonDefaults = {
@@ -54,6 +54,7 @@ const commonDefaults = {
   openURI: noopAsyncVoid,
   pickFile: noopAsyncString,
   pickFolder: noopAsyncString,
+  pickMediaFiles: async () => ({}),
   linkAccount: noopAsyncVoid,
   handleProtocol: noopVoid,
   /** @param {'stable' | 'nightly'} channel */
@@ -72,10 +73,15 @@ const commonDefaults = {
   onRequestPlay: noopVoid
 }
 const androidDefaults = {
-  minimize: noopVoid,
+  exit: noopVoid,
   showSplash: noopVoid,
   toast: noopAsyncVoid,
   onBackButton: noopVoid,
+  onAppStateChange: noopAsyncVoid,
+  onPictureInPictureModeChanged: noopAsyncVoid,
+  onMediaAction: noopAsyncVoid,
+  setMediaSession: noopVoid,
+  exitPiP: noopAsyncVoid,
   hideStatusBar: noopVoid,
   /** @param {'LIGHT' | 'DARK'} style */
   setSystemStyle: (style = 'LIGHT') => {},
@@ -84,6 +90,7 @@ const androidDefaults = {
 }
 const electronDefaults = {
   exit: noopVoid,
+  cacheFlushed: noopVoid,
   setDoH: noopVoid,
   getAngle: async () => 'default',
   setAngle: noopVoid,
@@ -94,12 +101,15 @@ const electronDefaults = {
   hideWindow: noopVoid,
   showAndFocus: noopVoid,
   onExitIntent: noopVoid,
+  onFlushCache: noopVoid,
   openTorrentDevTools: noopVoid,
   openDevTools: noopVoid,
   setUnreadCount: noopVoid,
   setDiscordRPC: noopVoid,
   setPresence: noopVoid,
   clearPresence: noopVoid,
+  showTextContextMenu: noopVoid,
+  onSelectContextText: noopVoid,
   getYouTube: async () => 'https://www.youtube-nocookie.com'
 }
 

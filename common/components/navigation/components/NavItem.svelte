@@ -95,7 +95,7 @@
     <Users class={iconCss} style='height: {size}; width: {size};' strokeWidth='2.5' />
   </NavLink>
 {:else if item === page.TORRENT_MANAGER}
-  <NavLink click={getClick(item)} page={page.TORRENT_MANAGER} text='Torrents' class={$$restProps.class} {drawer} {sidebar}>
+  <NavLink click={getClick(item)} page={page.TORRENT_MANAGER} text='Manager' class={$$restProps.class} {drawer} {sidebar}>
     <Download class={iconCss} style='height: {size}; width: {size};' strokeWidth='2.5' />
   </NavLink>
 {:else if item === 'UPDATE_DOWNLOADING'}
@@ -123,7 +123,7 @@
 {:else if item === modal.PROFILE}
   <NavLink click={getClick(item)} modal={modal.PROFILE} text={Helper.getUser() ? 'Profiles' : 'Login'} class={$$restProps.class} {drawer} {sidebar} let:active>
     {#if Helper.getUserAvatar()}
-      <img src={Helper.getUserAvatar()} class={`${drawer ? '' : 'p-3 m-5'} noselect-transition`} style='height: {size}; width: {size};' class:noselect={!active} alt='profile' />
+      <img src={Helper.getUserAvatar()} class={`${drawer ? '' : 'p-3 m-5'} noselect-transition rounded-2`} style='height: {size}; width: {size};' class:noselect={!active} alt='profile' />
     {:else}
       <LogIn class={iconCss} style='height: {size}; width: {size};' strokeWidth='2.5' />
     {/if}

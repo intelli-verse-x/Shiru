@@ -1,15 +1,15 @@
 <script>
-  import { click } from '@/modules/lib/click.js'
-  import SettingCard from '@/routes/settings/components/SettingCard.svelte'
-  import ConfirmButton from '@/components/inputs/ConfirmButton.svelte'
-  import { stringToHex, capitalize, debounce } from '@/modules/util.js'
+  import { TriangleAlert, CircleAlert, Github, Folder, FileQuestion, Trash2, CircleX, ChevronDown, ChevronUp, SquarePlus, Adult, Settings, RefreshCw } from 'lucide-svelte'
   import { getKey, normalizeUrl, VALID_SCHEMES, extensionManager } from '@/modules/extensions/manager.js'
+  import SettingCard from '@/routes/settings/components/SettingCard.svelte'
+  import { stringToHex, capitalize, debounce } from '@/modules/util.js'
+  import ConfirmButton from '@/components/inputs/ConfirmButton.svelte'
   import { cache, caches } from '@/modules/cache.js'
   import { status } from '@/modules/networking.js'
+  import { click } from '@/modules/lib/click.js'
   import { slide } from 'svelte/transition'
   import { marked } from 'marked'
   import DOMPurify from 'dompurify'
-  import { TriangleAlert, CircleAlert, Github, Folder, FileQuestion, Trash2, CircleX, ChevronDown, ChevronUp, SquarePlus, Adult, Settings, RefreshCw } from 'lucide-svelte'
   export let settings
 
   const activeWorkers = extensionManager.activeWorkers
@@ -17,12 +17,15 @@
   const updateExtensionSettings = debounce((key) => extensionManager.updateExtensionSettings(key), 500)
   const npmIcon = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABwAAAAcBAMAAACAI8KnAAAALVBMVEXLAADKAADMERHVSkrURkb////eeXnghITfgIDstrbFAADJAADhiorPJCTVSUliGH6+AAAAUklEQVR4AWMgETAKQoEAmKvsAgVGYEnTUCgIFmBgYmAQgOtiAHERACdXSNkBmevi/AGZyxrwAU3v4OJ+gLACGP7DA8dZgOGeixEi6ECUAIlhDgBoOA7wXH0RDQAAAABJRU5ErkJggg=='
 
-  $: mainTab = true
-  $: viewSources = false
-  $: viewSettings = {}
-  $: pendingSource = false
-  $: pendingReload = false
-  $: failedSource = null
+  let mainTab = true
+  let viewSources = false
+  let viewSettings = {}
+  let pendingSource = false
+  let pendingReload = false
+  let failedSource = null
+  let availableSources = {}
+  let availableExtensions = {}
+
   $: availableSources = (settings.extensionsNew && cache.getEntry(caches.EXTENSIONS, 'repositorySources')) || {}
   $: availableExtensions = (settings.extensionsNew && cache.getEntry(caches.EXTENSIONS, 'extensionSources')) || {}
 
@@ -70,7 +73,7 @@
   async function validateExtension(key) {
     if (pendingSource) return
     pendingSource = true
-    extensionManager.validateExtension(key).then(() => pendingSource = false)
+    extensionManager.validateExtension(key).then(() => (pendingSource = false))
   }
 
   async function reloadExtensions() {
@@ -110,7 +113,7 @@
     <label for='rss-autofile'>{settings.rssAutofile ? 'On' : 'Off'}</label>
   </div>
 </SettingCard>
-<SettingCard title='Auto-Scrape Results' description={'Automatically scrapes seeder and leecher counts when fetching extension results for torrent selection. When enabled, you\'ll see accurate peer data but results may load slower (5-15 seconds). When disabled, results load instantly but show the counts reported by indexers, which may be outdated. You can always manually scrape using the "Scrape" button in the torrent menu to refresh peer data on demand.'}>
+<SettingCard title='Auto-Scrape Results' description='Automatically scrapes seeder and leecher counts when fetching extension results for torrent selection. When enabled, you will see accurate peer data but results may load slower (5-15 seconds). When disabled, results load instantly but show the counts reported by indexers, which may be outdated. You can always manually scrape using the "Scrape" button in the torrent menu to refresh peer data on demand.'>
   <div class='custom-switch fit-content'>
     <input type='checkbox' id='rss-autoscrape' bind:checked={settings.torrentAutoScrape} />
     <label for='rss-autoscrape'>{settings.torrentAutoScrape ? 'On' : 'Off'}</label>
@@ -165,9 +168,9 @@
 </SettingCard>
 <SettingCard title='Preferred Providers' description='Prioritizes results matching the preferred providers. Providers are considered equally and used only when choosing the best available result.'>
   <div>
-    {#each settings.torrentProvider as _, i}
+    {#each settings.torrentProvider as _, i (i)}
       <div class='input-group mb-10 w-200 mw-full'>
-        <input id='torrent-provider-{i}' type='text' list='torrent-provider-list-{i}' class='w-400 form-control mw-full bg-dark text-truncate' placeholder={'QuickSubs'} autocomplete='off' bind:value={settings.torrentProvider[i]} />
+        <input id='torrent-provider-{i}' type='text' list='torrent-provider-list-{i}' class='w-400 form-control mw-full bg-dark text-truncate' placeholder='QuickSubs' autocomplete='off' bind:value={settings.torrentProvider[i]} />
         <div class='input-group-append'>
           <button type='button' use:click={() => { settings.torrentProvider.splice(i, 1); settings.torrentProvider = settings.torrentProvider }} class='btn btn-danger btn-square input-group-append px-5 d-flex align-items-center'><Trash2 size='1.8rem' /></button>
         </div>
@@ -198,7 +201,7 @@
         <div class='card m-0 p-15 mb-10 solid-border bg-error'>
           <div class='d-flex'>
             <TriangleAlert size='4.3rem' />
-            <div class='ml-10 mb-5 mb-md-0'>
+            <div class='ml-10 mb-5 mb-md-0 select-text'>
               <div class='font-size-18 font-weight-bold'>No Extensions Installed</div>
               <div class='text-muted pre-wrap'>This is not a bug, extensions are not included by default. Visit the <u>Sources</u> tab to add an extension source.</div>
             </div>
@@ -211,10 +214,10 @@
             {@const enabled = settings.extensionsNew[key]?.enabled}
             {@const isActive = $activeWorkers[key]}
             {@const isInactive = $status !== 'offline' && $inactiveWorkers[key]}
-            {@const extensionName = `${(extension?.name || extension?.id).slice(0, 25)}${extension?.name?.length > 25 ? '...' : ''}`}
+            {@const extensionName = `${(extension?.name || extension?.id)?.slice(0, 25)}${extension?.name?.length > 25 ? '...' : ''}`}
             <div class='card m-0 p-15 mb-10 bg-dark-light border position-relative' style='border-color: {stringToHex(extension?.locale || [extension?.update].flat()[0])} !important' class:extension-disabled={!enabled} class:extension-error={enabled && isInactive}>
               {#if enabled && isInactive}
-                <button class='btn position-absolute d-flex align-items-center justify-content-center border-0 p-0 z-10 bg-transparent icon-container' disabled={pendingSource} class:cursor-wait={pendingSource} data-toggle='tooltip' data-placement='right' data-title='Extension failed to validate. Click to retry.' use:click={() => validateExtension(key)}>
+                <button type='button' class='btn position-absolute d-flex align-items-center justify-content-center border-0 p-0 z-10 bg-transparent icon-container' disabled={pendingSource} class:cursor-wait={pendingSource} data-toggle='tooltip' data-placement='right' data-title='Extension failed to validate. Click to retry.' use:click={() => validateExtension(key)}>
                   <div class='d-flex align-items-center justify-content-center error-indicator' style='color: var(--danger-color)'><TriangleAlert size='3.6rem' fill='var(--dark-color-light)'/></div>
                 </button>
               {:else if enabled && !isActive}
@@ -230,7 +233,7 @@
                 {/if}
                 <div class='ml-10 mb-5 mb-md-0 w-full'>
                   <div class='d-flex'>
-                    <div class='font-size-18 font-weight-bold d-flex align-items-center text-break-word' title={extensionName}>
+                    <div class='font-size-18 font-weight-bold d-flex align-items-center text-break-word select-text' title={extensionName}>
                       {extensionName}
                     </div>
                     <div class='d-flex ml-auto pl-10 align-items-center gap-10 h-20'>
@@ -255,13 +258,14 @@
                     </div>
                   </div>
                   {#if extension?.description}
-                    <div class='text-muted pre-wrap text-break-word'>
+                    <div class='text-muted pre-wrap text-break-word select-text'>
+                      <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                       {@html parseSafeMarkdown(extension.description.slice(0, 500) + (extension.description.length > 500 ? '...' : ''))}
                     </div>
                   {/if}
                 </div>
               </div>
-              <div class='d-flex flex-wrap align-items-end'>
+              <div class='d-flex flex-wrap align-items-end select-text'>
                 <span class='badge border-0 bg-light pl-10 pr-10 mr-10 mt-10 font-scale-16'>{extension?.version}</span>
                 {#if extension?.type}<span class='badge border-0 bg-light pl-10 pr-10 mr-10 mt-10 font-scale-16'>{capitalize(extension?.type)}</span>{/if}
                 {#if extension?.speed}<span class='badge border-0 bg-light pl-10 pr-10 mr-10 mt-10 font-scale-16' data-toggle='tooltip' data-placement='top' data-title='How quickly query results are received'>{capitalize(extension?.speed)}</span>{/if}
@@ -272,17 +276,19 @@
                 <div transition:slide={{ duration: 250, axis: 'y' }}>
                   <div class='pt-15'>
                     <div class='bt-10 pt-15 mx-5'>
-                      {#each extension.settings as field, index}
+                      {#each extension.settings as field, index (index)}
                         {@const fieldKey = field.key.slice(0, 100)}
                         {@const fieldDefault = Array.isArray(field.default) ? field.default.map(value => typeof value === 'string' ? value.slice(0, 100) : value) : typeof field.default === 'string' ? field.default.slice(0, 100) : field.default}
                         <div class='d-flex flex-column flex-md-row align-items-md-center justify-content-between' class:mb-15={index < extension.settings.length - 1}>
                           <div class='mr-md-80 mb-5 mb-md-0'>
-                            <label class='font-weight-semi-bold font-scale-16 mb-0' for='ext-setting-{key}-{fieldKey}'>
+                            <label class='font-weight-semi-bold font-scale-16 mb-0 select-text cursor-text' for='ext-setting-{key}-{fieldKey}'>
+                              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                               {@html parseSafeMarkdown(field.label.slice(0, 35) + (field.label.length > 35 ? '...' : ''))}
                               {#if field.required}<span class='text-danger ml-5'>*</span>{/if}
                             </label>
                             {#if field.description}
-                              <div class='text-muted font-scale-14'>
+                              <div class='text-muted font-scale-14 select-text'>
+                                <!-- eslint-disable-next-line svelte/no-at-html-tags -->
                                 {@html parseSafeMarkdown(field.description.slice(0, 300) + (field.description.length > 300 ? '...' : ''))}
                               </div>
                             {/if}
@@ -312,14 +318,14 @@
                                 id='ext-setting-{key}-{fieldKey}'
                                 class='form-control bg-dark text-truncate w-auto wm-300 align-self-start'
                                 on:change={event => setSettingValue(key, fieldKey, event.target.value)}>
-                              {#each field.options as option}
+                              {#each field.options as option, optionIndex (optionIndex)}
                                 <option value={option.value.slice(0, 100)} selected={getSettingValue(key, fieldKey, fieldDefault) === option.value.slice(0, 100)}>{option.label.slice(0, 50)}</option>
                               {/each}
                             </select>
                           {:else if field.type === 'multiselect'}
                             {@const currentValues = (getSettingValue(key, fieldKey, fieldDefault ?? []) ?? [])}
                             <div class='d-flex flex-column align-self-start'>
-                              {#each currentValues as selected, i}
+                              {#each currentValues as selected, i (i)}
                                 <div class='input-group mb-10'>
                                   <select
                                       id='ext-setting-{key}-{fieldKey}-{i}'
@@ -328,7 +334,7 @@
                                         const current = [...currentValues]
                                         current[i] = event.target.value
                                         setSettingValue(key, fieldKey, current)}}>
-                                    {#each (field.options ?? []).filter(option => { const value = option.value.slice(0, 100); return !currentValues.some((_v, _i) => _i !== i && _v === value) }) as option}
+                                    {#each (field.options ?? []).filter(option => { const value = option.value.slice(0, 100); return !currentValues.some((_v, _i) => _i !== i && _v === value) }) as option, optionIndex (optionIndex)}
                                       <option value={option.value.slice(0, 100)} selected={selected === option.value.slice(0, 100)}>{option.label.slice(0, 50)}</option>
                                     {/each}
                                   </select>
@@ -373,12 +379,12 @@
 {:else}
   <div class='alert bg-warning border-warning-dim text-warning-very-dim wm-1200 p-10 pl-15 mb-5 d-flex'>
     <TriangleAlert size='1.8rem' />
-    <span class='ml-10'>Extensions are sandboxed and should be safe from attacks, but it is not recommended to add <u>unknown</u> or <u>untrusted</u> extensions.</span>
+    <span class='ml-10 select-text'>Extensions are sandboxed and should be safe from attacks, but it is not recommended to add <u>unknown</u> or <u>untrusted</u> extensions.</span>
   </div>
   {#if failedSource}
     <div class='alert bg-error border-error-light wm-1200 p-10 pl-15 mb-5 d-flex'>
       <CircleX size='1.8rem' />
-      <span class='ml-10'>{failedSource}</span>
+      <span class='ml-10 select-text'>{failedSource}</span>
     </div>
   {/if}
   <div class='input-group wm-1200 mb-20'>
@@ -387,7 +393,7 @@
   </div>
   <div class='wm-1200'>
     {#if Object.values(availableExtensions)?.length}
-      {#each Object.entries(Object.values(availableExtensions).reduce((a, { update, locale }) => { if (!a[[update].flat()[0]]) a[[update].flat()[0]] = { count: 0, locale }; a[[update].flat()[0]].count += 1; return a }, {})).map(([host, { count, locale }]) => ({ host, count, locale })) as extension}
+      {#each Object.entries(Object.values(availableExtensions).reduce((a, { update, locale }) => { if (!a[[update].flat()[0]]) a[[update].flat()[0]] = { count: 0, locale }; a[[update].flat()[0]].count += 1; return a }, {})).map(([host, { count, locale }]) => ({ host, count, locale })) as extension (extension)}
         <div class='d-flex align-items-center bg-dark-light border rounded-2 p-10 mb-10' style='border-color: {stringToHex(extension?.locale || extension?.host)} !important'>
           <div class='d-flex align-items-center ml-10'>
             {#if extension.locale}
@@ -400,8 +406,8 @@
               <FileQuestion size='2.2rem' />
             {/if}
           </div>
-          <span class='font-weight-semi-bold ml-10 overflow-hidden text-truncate mr-5 font-scale-18'>{(extension.locale || extension.host).replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
-          <span class='font-weight-semi-bold ml-auto text-muted text-nowrap text-truncate'>{extension.count} Extensions</span>
+          <span class='font-weight-semi-bold ml-10 overflow-hidden text-truncate mr-5 font-scale-18 select-text'>{(extension.locale || extension.host).replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
+          <span class='font-weight-semi-bold ml-auto text-muted text-nowrap text-truncate select-text'>{extension.count} Extensions</span>
           <ConfirmButton click={() => removeSource(extension.host)} title='Remove Source' class='btn btn-square d-flex align-items-center justify-content-center bg-transparent shadow-none border-0 {pendingSource ? `cursor-wait` : ``} text-danger' disabled={pendingSource} primaryClass='ml-10' confirmText='' cancelText='' confirmClass='btn-square text-success w-auto' cancelClass='ml-10 text-muted w-auto' actionClass='d-inline-flex flex-row-reverse'>
             <Trash2 size='1.8rem' />
           </ConfirmButton>
@@ -412,7 +418,7 @@
   {#if availableSources && Object.keys(availableSources)?.length}
     {@const addedSources = Object.keys(availableSources)}
     <div class='wm-1200'>
-      {#each addedSources as sourceUrl, i}
+      {#each addedSources as sourceUrl, i (i)}
         <div class='d-flex align-items-center bg-dark-light border rounded-2 p-10 mb-10'>
           <div class='d-flex align-items-center ml-10'>
             {#if sourceUrl.startsWith('extension:')}
@@ -425,8 +431,8 @@
               <FileQuestion size='2.2rem' />
             {/if}
           </div>
-          <span class='font-weight-semi-bold ml-10 overflow-hidden text-truncate mr-5 font-scale-18'>{sourceUrl.replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
-          <span class='font-weight-semi-bold ml-auto text-muted text-nowrap text-truncate'>{availableSources[sourceUrl].length} Sources</span>
+          <span class='font-weight-semi-bold ml-10 overflow-hidden text-truncate mr-5 font-scale-18 select-text'>{sourceUrl.replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
+          <span class='font-weight-semi-bold ml-auto text-muted text-nowrap text-truncate select-text'>{availableSources[sourceUrl].length} Sources</span>
           <ConfirmButton click={() => removeSource(sourceUrl, true)} title='Remove Repository' class='btn btn-square d-flex align-items-center justify-content-center bg-transparent shadow-none border-0 {pendingSource ? `cursor-wait` : ``} text-danger' disabled={pendingSource} primaryClass='ml-10' confirmText='' cancelText='' confirmClass='btn-square text-success w-auto' cancelClass='ml-10 text-muted w-auto' actionClass='d-inline-flex flex-row-reverse'>
             <Trash2 size='1.8rem' />
           </ConfirmButton>
@@ -445,7 +451,7 @@
       </div>
       {#if viewSources}
         <div class='wm-1200 mt-5'>
-          {#each missingSources as source, i}
+          {#each missingSources as source, i (i)}
             <div class='d-flex align-items-center bg-dark-light border rounded-2 p-10 mb-10'>
               <div class='d-flex align-items-center ml-10'>
                 {#if source.startsWith('extension:')}
@@ -458,7 +464,7 @@
                   <FileQuestion size='2.2rem' />
                 {/if}
               </div>
-              <span class='font-weight-semi-bold ml-10 font-scale-18'>{source.replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
+              <span class='font-weight-semi-bold ml-10 font-scale-18 select-text'>{source.replace(VALID_SCHEMES, '').replace(/^\/+/, '')}</span>
               <button type='button' use:click={() => { addSource(source); if (missingSources.length <= 1) viewSources = !viewSources }} class='btn btn-square d-flex align-items-center justify-content-center ml-10 bg-transparent shadow-none border-0 ml-auto' title='Add Source' style='color: var(--success-color)' disabled={pendingSource} class:cursor-wait={pendingSource}><SquarePlus size='1.8rem' /></button>
             </div>
           {/each}

@@ -100,8 +100,8 @@ class AnimeSchedule {
         }
 
         scheduleNextCheck()
-        this.dubAiringLists.subscribe(async value  => this.dubAiring.value = await value)
-        this.subAiringLists.subscribe(async value  => this.subAiring.value = await value)
+        this.dubAiringLists.subscribe(async value  => (this.dubAiring.value = await value))
+        this.subAiringLists.subscribe(async value  => (this.subAiring.value = await value))
     }
 
     async findNewDelayedEpisodes() { // currently only dubs are handled as they typically get delayed...
@@ -113,7 +113,7 @@ class AnimeSchedule {
         for (const entry of delayedEpisodes) {
             const media = entry?.media?.media
             const cachedMedia = await cache.requestMedia(media?.id)
-            const notify = (cache.getEntry(caches.NOTIFICATIONS, `lastDub`) > 0) && ((!cachedMedia?.mediaListEntry && settings.value.releasesNotify?.includes('NOTONLIST')) || (cachedMedia?.mediaListEntry && settings.value.releasesNotify?.includes(cachedMedia?.mediaListEntry?.status)))
+            const notify = (cache.getEntry(caches.NOTIFICATIONS, `lastDub`) > 0) && !settings.value.releasesNotifyDisabled?.[cachedMedia?.mediaListEntry?.status || 'NOTONLIST']?.includes('Dub') && ((!cachedMedia?.mediaListEntry && settings.value.releasesNotify?.includes('NOTONLIST')) || (cachedMedia?.mediaListEntry && settings.value.releasesNotify?.includes(cachedMedia?.mediaListEntry?.status)))
             if (notify && media.format !== 'MUSIC') {
                 queueNotification({
                     id: media?.id,
@@ -157,7 +157,7 @@ class AnimeSchedule {
             debug(`Checking for new ${type} Schedule notifications`)
             const newNotifications = (await this[airingListKey].value)?.filter(entry => (entry?.unaired && ((type !== 'Hentai' && !(entry?.media?.media?.genres || entry?.genres)?.includes('Hentai')) || (type === 'Hentai' && (entry?.media?.media?.genres || entry?.genres)?.includes('Hentai'))) && !cache.getEntry(caches.NOTIFICATIONS, notifyKey).includes(entry?.media?.media?.id || entry?.id))).map(entry => entry?.media?.media || entry)
             debug(`Found ${newNotifications?.length} new ${type} notifications`)
-            if (!newNotifications?.length) return
+            if (!newNotifications?.length) continue
             await anilistClient.searchAllIDS({ id: newNotifications.map(media => media.id).filter(Boolean) })
             for (const media of newNotifications) {
                 const cachedMedia = await cache.requestMedia(media?.id)
@@ -378,12 +378,17 @@ class AnimeSchedule {
         if (type === 'Dub' || type === 'Sub' || type === 'Hentai') {
             if (type === 'Hentai' && settings.value.adult !== 'hentai') return
             const lastNotified = cache.getEntry(caches.NOTIFICATIONS, `last${type}`)
-            const newReleases = combinedItems?.data?.Page?.media?.filter(media => (Math.floor(new Date(media.episode.airedAt).getTime() / 1000) >= lastNotified) || (Math.floor(new Date(media.episode.addedAt).getTime() / 1000) >= lastNotified))
+            const newReleases = combinedItems?.data?.Page?.media?.filter(media => {
+                const airedAt = Math.floor(new Date(media.episode.airedAt).getTime() / 1_000)
+                const addedAt = Math.floor(new Date(media.episode.addedAt).getTime() / 1_000)
+                // skip if more than 10 minutes in the future, likely a bad entry...
+                return (!(airedAt > currentTime + 600) && airedAt >= lastNotified) || (!(addedAt > currentTime + 600) && addedAt >= lastNotified)
+            })
             debug(`Found ${newReleases?.length} new ${type} releases, notifying...`)
             if (newReleases && settings.value.releasesNotify?.length > 0 && lastNotified > 0) {
                 for (const media of newReleases) {
                     const addedAt = Math.floor(new Date(media.episode.addedAt).getTime() / 1000)
-                    const notify = (!media?.mediaListEntry && settings.value.releasesNotify?.includes('NOTONLIST')) || (media?.mediaListEntry && settings.value.releasesNotify?.includes(media?.mediaListEntry?.status))
+                    const notify = !settings.value.releasesNotifyDisabled?.[media?.mediaListEntry?.status || 'NOTONLIST']?.includes(type) && ((!media?.mediaListEntry && settings.value.releasesNotify?.includes('NOTONLIST')) || (media?.mediaListEntry && settings.value.releasesNotify?.includes(media?.mediaListEntry?.status)))
                     debug(`Attempting to notify for ${media?.id}:${media?.title?.userPreferred}...`)
                     if (notify && (type === 'Dub' || !settings.value.preferDubs || (media?.status === 'FINISHED' && !['CURRENT', 'REPEATING']?.includes(media?.mediaListEntry?.status)) || !(await malDubs.isDubMedia(media)) || await isSubbedProgress(media)) && media.format !== 'MUSIC') {
                         queueNotification({
@@ -427,7 +432,7 @@ class AnimeSchedule {
             const res = {
                 ...result,
                 parseObject: {
-                    language: (type === 'Dub' ? 'English' : 'Japanese')
+                    audio_term: (type === 'Dub' ? 'English Audio' : 'Japanese Audio')
                 },
                 episodeData: undefined,
                 onclick: undefined

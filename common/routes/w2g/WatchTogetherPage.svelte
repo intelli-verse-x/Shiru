@@ -4,7 +4,7 @@
   import { status } from '@/modules/networking.js'
   import { SUPPORTS } from '@/modules/support.js'
   import { page } from '@/modules/navigation.js'
-  import { COMMON, TORRENT } from '@/modules/bridge.js'
+  import { COMMON } from '@/modules/bridge.js'
   import { loadedTorrent } from '@/modules/torrent.js'
   import { settings } from '@/modules/settings.js'
   import { toast } from '@/modules/lib/toast.js'
@@ -47,8 +47,8 @@
 
   // Only allow host to change magnet.
   // TODO: Make this an optional setting.
-  TORRENT.onMagnet(magnet => {
-    if (state.value?.isHost) state.value.magnetLink(magnet)
+  loadedTorrent.subscribe(torrent => {
+    if (torrent?.magnetURI && state.value?.isHost && state.value.magnet?.hash !== torrent.infoHash) state.value.magnetLink({ magnet: torrent.magnetURI, hash: torrent.infoHash })
   })
 
   w2gEmitter.addEventListener('player', ({ detail }) => state.value?.playerStateChanged(detail))
@@ -68,10 +68,9 @@
 
 <script>
   import Lobby from '@/routes/w2g/components/Lobby.svelte'
-  import { Plus, UserPlus } from 'lucide-svelte'
+  import { Plus, UserPlus, TriangleAlert } from 'lucide-svelte'
   import { W2GClient } from '@/routes/w2g/components/w2g.js'
   import { click } from '@/modules/lib/click.js'
-  import { TriangleAlert } from 'lucide-svelte'
 
   let joinText
 
@@ -88,7 +87,7 @@
   $: checkInvite(joinText)
 </script>
 
-<div class='d-flex h-full align-items-center flex-column px-md-20 overflow-y-auto' class:pt-safe-area={!$status.match(/offline/i)}>
+<div class='d-flex h-full align-items-center flex-column px-md-20 overflow-y-auto' class:pt-safe-area={$status === 'online'}>
   {#if !$state}
     <div class='alert bg-warning border-warning-dim text-warning-very-dim p-10 pl-15 mb-5 d-flex mt-10'>
       <TriangleAlert size='1.8rem' />
@@ -100,12 +99,12 @@
         <UserPlus size='6rem' class='d-flex align-items-center h-full' />
         <h2 class='font-weight-bold font-scale-34'>Join Lobby</h2>
         <input
-          type='text'
-          class='form-control h-80 text-center'
-          autocomplete='off'
-          bind:value={joinText}
-          data-option='search'
-          placeholder='Lobby Code or Link' />
+            type='text'
+            class='form-control h-80 text-center'
+            autocomplete='off'
+            bind:value={joinText}
+            data-option='search'
+            placeholder='Lobby Code or Link' />
       </div>
       <div class='card d-flex flex-column align-items-center w-300 h-300 justify-content-end'>
         <Plus size='6rem' class='d-flex align-items-center h-full' />

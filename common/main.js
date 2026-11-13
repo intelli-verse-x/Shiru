@@ -1,8 +1,8 @@
 import 'quartermoon/css/quartermoon-variables.css'
 import '@fontsource-variable/nunito'
-import { cacheReady, migrationStatus } from '@/modules/cache.js'
+import { cache, cacheReady, migrationStatus } from '@/modules/cache.js'
 import { SUPPORTS } from '@/modules/support.js'
-import { COMMON } from '@/modules/bridge.js'
+import { COMMON, ELECTRON } from '@/modules/bridge.js'
 import '@/css.css'
 import '@/themes.css'
 import '@/typography.css'
@@ -14,15 +14,25 @@ if (!SUPPORTS.isAndroid && await COMMON.isWindowVisible()) {
 }
 
 let migration = null
+let migrationReady
 const unsubscribe = migrationStatus.subscribe(value => {
-  if (value !== null && !migration) {
-    import('./Migration.svelte').then(({ default: Migration }) => {
+  if (value !== null && !migrationReady) {
+    migrationReady = import('./Migration.svelte').then(({ default: Migration }) => {
       migration = new Migration({ target: document.body })
     })
   }
 })
 
 await cacheReady()
+await migrationReady
+ELECTRON.onFlushCache(async () => {
+  try {
+    await cache.flush()
+  } finally {
+    ELECTRON.cacheFlushed()
+  }
+})
+
 unsubscribe()
 const target = migration ?? splash
 if (target) {

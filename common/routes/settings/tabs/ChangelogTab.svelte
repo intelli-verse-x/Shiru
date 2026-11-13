@@ -6,19 +6,19 @@
   export let version
 </script>
 
-<div class='{$$restProps.class}'>
+<div class='select-text {$$restProps.class}'>
   <div class='column px-20 px-sm-0'>
     <h4 class='mb-10 font-weight-bold'>Changelog</h4>
     <div class='font-size-18 text-muted'>New updates and improvements to Shiru.</div>
     <div class='font-size-14 text-muted'>Your current App Version is <b>v{version}</b></div>
   </div>
   {#await $changeLog}
-    {#each Array(5) as _}
+    {#each Array(5) as _, skeletonIndex (skeletonIndex)}
       <ChangelogSk />
     {/each}
   {:then changelog}
     {#if changelog?.length}
-      {#each changelog.slice(0, 5) as { version, date, body }}
+      {#each changelog.slice(0, 5) as { version, date, body }, changelogIndex (changelogIndex)}
         <hr class='my-20' />
         <div class='row py-20 px-20 px-sm-0 position-relative text-wrap text-break'>
           <div class='col-sm-3 order-first text-white mb-10 mb-sm-0'>
@@ -50,7 +50,7 @@
       </div>
     {/if}
   {:catch e}
-    {#each Array(5) as _}
+    {#each Array(5) as _, skeletonIndex (skeletonIndex)}
       <ChangelogSk />
     {/each}
   {/await}

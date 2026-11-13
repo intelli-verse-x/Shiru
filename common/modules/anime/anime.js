@@ -1,5 +1,5 @@
 import { codes, DOMPARSER, getRandomInt, countdown, sleep, isValidNumber } from '@/modules/util.js'
-import { printError } from '@/modules/networking.js'
+import { printError, status } from '@/modules/networking.js'
 import { anilistClient } from '@/modules/providers/anilist/anilist.js'
 import { toast } from '@/modules/lib/toast.js'
 import _anitomyscript from 'anitomyscript'
@@ -12,7 +12,6 @@ import AnimeResolver from '@/modules/anime/animeresolver.js'
 import { settings } from '@/modules/settings.js'
 import { cache, caches, mediaCache } from '@/modules/cache.js'
 import { COMMON, ELECTRON } from '@/modules/bridge.js'
-import { status } from '@/modules/networking.js'
 import { derived } from 'simple-store-svelte'
 import Helper from '@/modules/providers/helper.js'
 import Bottleneck from 'bottleneck'
@@ -107,8 +106,7 @@ export async function traceAnime (image) { // WAIT lookup logic
       clearNext: true,
       load: (page = 1, perPage = 50, variables = {}) => {
         const res = anilistClient.searchIDS({ page, perPage, id: ids, ...SectionsManager.sanitiseObject(variables) }).then(async res => {
-          for (const index in res.data?.Page?.media) {
-            const media = res.data.Page.media[index]
+          for (const [index, media] of (res.data?.Page?.media || []).entries()) {
             const counterpart = result.find(({ anilist }) => anilist === media.id)
             const metadata = (await getEpisodeMetadataForMedia(media))?.[counterpart.episode] || {}
             res.data.Page.media[index] = {
@@ -135,76 +133,48 @@ export async function traceAnime (image) { // WAIT lookup logic
   }
 }
 
-function constructChapters (results, duration) {
-  const chapters = results.map(result => {
-    const diff = duration - result.episodeLength
-    return {
-      start: (result.interval.startTime + diff) * 1000,
-      end: (result.interval.endTime + diff) * 1000,
-      text: result.skipType.toUpperCase()
-    }
-  })
-  const ed = chapters.find(({ text }) => text === 'ED')
-  const recap = chapters.find(({ text }) => text === 'RECAP')
-  if (recap) recap.text = 'Recap'
-
-  chapters.sort((a, b) => a - b)
-  if ((chapters[0].start | 0) !== 0) {
-    chapters.unshift({ start: 0, end: chapters[0].start, text: chapters[0].text === 'OP' ? 'Intro' : 'Episode' })
-  }
-  if (ed) {
-    if ((ed.end | 0) + 5000 - duration * 1000 < 0) {
-      chapters.push({ start: ed.end, end: duration * 1000, text: 'Preview' })
-    }
-  } else if ((chapters[chapters.length - 1].end | 0) + 5000 - duration * 1000 < 0) {
-    chapters.push({
-      start: chapters[chapters.length - 1].end,
-      end: duration * 1000,
-      text: 'Episode'
-    })
-  }
-
-  for (let i = 0, len = chapters.length - 2; i <= len; ++i) {
-    const current = chapters[i]
-    const next = chapters[i + 1]
-    if ((current.end | 0) !== (next.start | 0)) {
-      chapters.push({
-        start: current.end,
-        end: next.start,
-        text: 'Episode'
-      })
-    }
-  }
-
-  chapters.sort((a, b) => a.start - b.start)
-
-  return chapters
-}
-
-export async function getChaptersAniSkip (file, duration) {
-  const resAccurate = await fetch(`https://api.aniskip.com/v2/skip-times/${file.media.media.idMal}/${file.media.episode}/?episodeLength=${duration}&types=op&types=ed&types=recap`)
-  if (!resAccurate?.ok) return []
-  const jsonAccurate = await resAccurate.json()
-  if (!jsonAccurate?.ok) return []
-
-  const resRough = await fetch(`https://api.aniskip.com/v2/skip-times/${file.media.media.idMal}/${file.media.episode}/?episodeLength=0&types=op&types=ed&types=recap`)
-  const jsonRough = await resRough.json()
-
-  const map = {}
-  if (jsonAccurate?.statusCode === 500 || jsonRough?.statusCode === 500) return []
-  for (const result of [...jsonAccurate.results, ...jsonRough.results]) {
-    map[result.skipType] ||= result
-  }
-
-  const results = Object.values(map)
-  if (!results.length) return []
-  return constructChapters(results, duration)
-}
-
 export function getMediaMaxEp (media, playable) {
   if (!media) return 0
   else if (playable) return media.nextAiringEpisode?.episode - 1 || lastAired(media.airingSchedule?.nodes)?.episode || (media.status === 'NOT_YET_RELEASED' ? 0 : media.episodes) || (media.status === 'RELEASING' ? (media.mediaListEntry?.progress ?? 1) : 0)
-  else return Math.max(media.airingSchedule?.nodes?.[media.airingSchedule?.nodes?.length - 1]?.episode || 0, media.airingSchedule?.nodes?.length || 0, (!media.streamingEpisodes || (media.status === 'FINISHED' && media.episodes) ? 0 : media.streamingEpisodes?.filter((ep) => { const match = (/Episode (\d+(\.\d+)?) - /).exec(ep.title); return match ? Number.isInteger(parseFloat(match[1])) : false}).length), media.episodes || 0, media.nextAiringEpisode?.episode || 0) || (media.status === 'RELEASING' ? (media.mediaListEntry?.progress ?? 1) : 0)
+  else return Math.max(media.airingSchedule?.nodes?.[media.airingSchedule?.nodes?.length - 1]?.episode || 0, media.airingSchedule?.nodes?.length || 0, (!media.streamingEpisodes || (media.status === 'FINISHED' && media.episodes) ? 0 : media.streamingEpisodes?.filter((ep) => { const match = (/Episode (\d+(\.\d+)?) - /).exec(ep.title); return match ? Number.isInteger(parseFloat(match[1])) : false }).length), media.episodes || 0, media.nextAiringEpisode?.episode || 0) || (media.status === 'RELEASING' ? (media.mediaListEntry?.progress ?? 1) : 0)
+}
+
+/**
+ * Returns the mapped episode count for a media entry, taking into account the known episode count and any additional information from the mappings.
+ * @param media
+ * @param mappings
+ * @returns {number}
+ */
+export function getMappedEpisodeCount(media, mappings) {
+  const count = mappings?.episodeCount
+  const knownCount = media?.episodes
+  if (media?.status !== 'FINISHED' || !knownCount || !(count > knownCount)) return count
+
+  if (media.airingSchedule?.nodes?.some(node => node.episode > knownCount) ||
+    media.streamingEpisodes?.some(episode => Number(/^Episode (\d+) - /.exec(episode.title)?.[1]) > knownCount)) return count
+
+  const regularEpisodes = Object.entries(mappings.episodes || {}).filter(([key]) => Number.isInteger(Number(key)) && Number(key) > 0)
+  // A movie split into streaming parts can legitimately have a much larger episode count.
+  const runtimes = regularEpisodes.map(([, episode]) => Number(episode.length || episode.runtime))
+  const totalRuntime = runtimes.reduce((sum, runtime) => sum + runtime, 0)
+  const splitMovie = media.duration > 0 && regularEpisodes.length === count && runtimes.every(runtime => runtime > 0) &&
+    totalRuntime >= media.duration * 0.75 && totalRuntime <= media.duration * 1.25
+  if (knownCount === 1 && splitMovie) return count
+
+  // A completed one-episode release mapped to an entire season is suspicious even without dates.
+  if (knownCount === 1 && count >= 6) return knownCount
+
+  const end = media.endDate
+  if (!end?.year || !end.month || !end.day) return count
+  const endTime = Date.UTC(end.year, end.month - 1, end.day)
+  const tolerance = 30 * 24 * 60 * 60 * 1_000 // 30 days
+  const episodeDate = episode => Date.parse(episode?.airDateUtc || episode?.airdate || episode?.airDate)
+  const lastDate = episodeDate(mappings.episodes?.[knownCount])
+  const extras = regularEpisodes.filter(([key]) => Number(key) > knownCount)
+  // Require a matching final episode and complete evidence that the extras aired after this entry ended.
+  if (Math.abs(lastDate - endTime) <= tolerance && extras.length === count - knownCount &&
+    extras.every(([, episode]) => episodeDate(episode) > endTime + tolerance)) return knownCount
+  return count
 }
 
 // utility method for correcting anitomyscript woes for what's needed
@@ -259,18 +229,18 @@ function addAnimeType(obj, newType) {
 
 /**
  * Checks if a series has a zero episode.
- *
+ * AniList: 146065, 20657, 21180, 195153.
  * @param media
  * @param existingMappings
  * @returns {Promise<[unknown]|[{title: (string|string|*), thumbnail, length, summary, airingAt: *}]|null>}
  */
 export async function hasZeroEpisode(media, existingMappings) { // really wish they could make fetching zero episodes less painful.
   if (!media) return null
-  const mappings = existingMappings || (await getAniMappings(media.id)) || {}
-  const hasZeroEpisode = media.streamingEpisodes?.filter((ep) => { const match = (/Episode (\d+(\.\d+)?) - /).exec(ep.title); return match ? Number.isInteger(parseFloat(match[1])) && Number(parseFloat(match[1])) === 0 : false})
+  const mappings = existingMappings || (await getAniMappings(media)) || {}
+  const hasZeroEpisode = media.streamingEpisodes?.filter((ep) => { const match = (/Episode (\d+(\.\d+)?) - /).exec(ep.title); return match ? Number.isInteger(parseFloat(match[1])) && Number(parseFloat(match[1])) === 0 : false })
   const zeroAsFirstEpisode = /episode\s*0/i.test(mappings?.episodes?.[1]?.title?.en || mappings?.episodes?.[1]?.title?.jp) // The first episode is titled as Episode 0 so this is likely a Prologue, fixes issues with series like `Fate/stay night: Unlimited Blade Works`
   // no clue what fixed Mushoku but this initial part seems to allow 'Episode 0 : Guardian Fits' to properly be mapped to season 2 part 1, ensure when making changes this doesn't appear on season 1 part 1.
-  if (hasZeroEpisode?.length > 0 && ((media.episodes >= media.streamingEpisodes?.length) || zeroAsFirstEpisode)) {
+  if (hasZeroEpisode?.length > 0 && ((media.episodes >= media.streamingEpisodes?.length) || zeroAsFirstEpisode)) { // TODO: This assumption is risky and needs more testing.
     const title = hasZeroEpisode[0]?.title?.replace('Episode 0 - ', '')
     const prequel = title?.length > 4 && await AnimeResolver.getAnimeById(AnimeResolver.findEdge(media, 'PREQUEL', ['SPECIAL'])?.node?.id)
     if (!prequel || !Object.values(prequel.title).filter(Boolean).some(_title => _title.toLowerCase().includes(title.toLowerCase()))) {
@@ -279,7 +249,16 @@ export async function hasZeroEpisode(media, existingMappings) { // really wish t
   }
   if (!(media.episodes && media.episodes === mappings?.episodeCount && media.status === 'FINISHED')) {
     const special = (mappings?.episodes?.S0 || mappings?.episodes?.s0 || mappings?.episodes?.S1 || mappings?.episodes?.s1)
-    if (mappings?.specialCount > 0 && special?.airedBeforeEpisodeNumber > 0) { // very likely it's a zero episode, streamingEpisodes were likely just empty...
+    const firstEpisode = mappings?.episodes?.[1]
+    const firstSeason = firstEpisode?.seasonNumber
+    const specialDate = Date.parse(special?.airDateUtc || special?.airdate || special?.airDate)
+    const firstDate = Date.parse(firstEpisode?.airDateUtc || firstEpisode?.airdate || firstEpisode?.airDate)
+    // A special must precede episode 1 of this season; season 0 alone also includes mid-season specials.
+    if (mappings?.specialCount > 0 && firstSeason > 0 &&
+      special?.airedBeforeEpisodeNumber === 1 && special?.airedBeforeSeasonNumber === firstSeason &&
+      !(special?.airedAfterSeasonNumber >= firstSeason) &&
+      !(special?.airedAfterEpisodeNumber > 0 && !special?.airedAfterSeasonNumber) &&
+      !(specialDate > firstDate)) {
       return [{title: special.title?.en, thumbnail: special.image, length: special.length, summary: special.summary, airingAt: special.airDateUtc}]
     }
   }
@@ -807,7 +786,6 @@ export async function playMedia (media) {
     }
   }
   playAnime(media, ep)
-  media = null
 }
 
 export function setStatus (status, other = {}, media) {
@@ -829,10 +807,10 @@ const episodeMetadataMap = new Map()
 export async function getEpisodeMetadataForMedia (media) {
   if (episodeMetadataMap.has(`${media?.id}`)) return episodeMetadataMap.get(`${media?.id}`)
   const promiseData = (async () => {
-    //const aniMappings = (await getAniMappings(media?.id) || {})?.episodes
+    //const aniMappings = (await getAniMappings(media) || {})?.episodes
     //if (!aniMappings || !Object.keys(aniMappings).length) return kitsuToAniEpisodes(await episodesList.getKitsuEpisodes(media?.id))
     //else return aniMappings
-    return (await getAniMappings(media?.id) || {})?.episodes
+    return (await getAniMappings(media) || {})?.episodes
   })()
   episodeMetadataMap.set(`${media?.id}`, promiseData)
   return promiseData
@@ -909,10 +887,10 @@ export function nextAiring(nodes, variables) {
 export function lastAired(nodes, variables) {
   const currentTime = new Date()
   return nodes?.filter(node => new Date(variables?.hideSubs ? node.airingAt : (node.airingAt * 1000)) < currentTime)?.sort((a, b) => {
-      const timeDiff = b.airingAt - a.airingAt
-      if (timeDiff !== 0) return timeDiff
-      return (b.episode || 0) - (a.episode || 0)
-    })?.shift()
+    const timeDiff = b.airingAt - a.airingAt
+    if (timeDiff !== 0) return timeDiff
+    return (b.episode || 0) - (a.episode || 0)
+  })?.shift()
 }
 
 export async function isSubbedProgress(media) {
@@ -996,25 +974,29 @@ aniLimiter.on('failed', async (error) => {
   if (status.value === 'offline') throw new Error('Failed making request to api.ani.zip, network is offline... not retrying')
   if (error.status === 500) return 1
   if (!error.statusText) {
-    if (!aniRateLimitPromise) aniRateLimitPromise = sleep(10 * 1000).then(() => { aniRateLimitPromise = null })
-    return 10 * 1000
+    if (!aniRateLimitPromise) aniRateLimitPromise = sleep(10 * 1_000).then(() => { aniRateLimitPromise = null })
+    return 10 * 1_000
   }
-  const time = (Number((error.headers.get('retry-after') || 10)) + 1) * 1000
+  const time = (Number((error.headers.get('retry-after') || 10)) + 1) * 1_000
   if (!aniRateLimitPromise) aniRateLimitPromise = sleep(time).then(() => { aniRateLimitPromise = null })
   return time
 })
 
-export async function getAniMappings(anilistID) {
-  if (!anilistID) return
-  const cachedEntry = cache.cachedEntry(caches.QUERY_MAPPINGS, `ani-${anilistID}`, status.value === 'offline')
-  if (cachedEntry) return cachedEntry
+export async function getAniMappings(opts) {
+  const corrections = correctAniMappings(opts)
+  opts = corrections.options
+  if (!opts?.id && !opts?.idMal) return
+  const cacheKey = opts.id ? `ani-${opts.id}` : `mal-${opts.idMal}`
+  const cachedEntry = cache.cachedEntry(caches.QUERY_MAPPINGS, cacheKey, status.value === 'offline')
+  if (cachedEntry) return corrections.apply(await cachedEntry)
   else if (status.value === 'offline') return
-  if (concurrentRequests.has(`ani-${anilistID}`)) return concurrentRequests.get(`ani-${anilistID}`)
+  if (concurrentRequests.has(cacheKey)) return corrections.apply(await concurrentRequests.get(cacheKey))
   const requestPromise = aniLimiter.wrap(async () => {
     await aniRateLimitPromise
-    let res = {}
+    let res
     try {
-      res = await fetch(`https://api.ani.zip/mappings?anilist_id=${anilistID}`)
+      res = await fetch(`https://api.ani.zip/v1/episodes?${opts.id ? `anilist_id=${opts.id}` : `mal_id=${opts.idMal}`}`)
+      if (res?.status === 404 && opts.id && opts.idMal) res = await fetch(`https://api.ani.zip/v1/episodes?mal_id=${opts.idMal}`)
     } catch (e) {
       if (!res || res.status !== 404) throw e
     }
@@ -1038,22 +1020,43 @@ export async function getAniMappings(anilistID) {
         }
       }
       const date = new Date()
-      const media = cache.getMedia(anilistID)
-      const cacheDuration = media?.status === 'FINISHED' && media?.endDate && (date.getFullYear() - media.endDate.year) * 12 + (date.getMonth() + 1 - media.endDate.month) >= 12 ? getRandomInt(24, 48) * 60 * 60 * 1_000 : getRandomInt(30, 60) * 60 * 1_000
-      return cache.cacheEntry(caches.QUERY_MAPPINGS, `ani-${anilistID}`, {}, json, date.getTime() + cacheDuration) // caches currently airing series for 30 to 60 minutes, or 24 to 48 hours for series that finished at least a year ago (its highly unlikely the mappings will change drastically at that point).
+      const media = opts.id && cache.getMedia(opts.id)
+      const cacheDuration = media?.status === 'FINISHED' && media?.endDate && (date.getFullYear() - media.endDate.year) * 12 + (date.getMonth() + 1 - media.endDate.month) >= 12 ? getRandomInt(24, 72) * 60 * 60 * 1_000 : getRandomInt(2, 6) * 60 * 60 * 1_000
+      return cache.cacheEntry(caches.QUERY_MAPPINGS, cacheKey, {}, json, date.getTime() + cacheDuration) // caches currently airing series for 30 to 60 minutes, or 24 to 48 hours for series that finished at least a year ago (its highly unlikely the mappings will change drastically at that point).
     } catch (e) {
-      const cachedEntry = cache.cachedEntry(caches.QUERY_MAPPINGS, `ani-${anilistID}`, true)
+      const cachedEntry = cache.cachedEntry(caches.QUERY_MAPPINGS, cacheKey, true)
       if (cachedEntry) {
-        debug(`Failed to request Anilist Mappings for ${anilistID}, this is likely due to an outage... falling back to cached data.`)
+        debug(`Failed to request Ani mappings for ${opts.id || opts.idMal}, this is likely due to an outage... falling back to cached data.`)
         return cachedEntry
       }
       else throw e
     }
   })().finally(() => {
-    concurrentRequests.delete(`ani-${anilistID}`)
+    concurrentRequests.delete(cacheKey)
   })
-  concurrentRequests.set(`ani-${anilistID}`, requestPromise)
-  return requestPromise
+  concurrentRequests.set(cacheKey, requestPromise)
+  return corrections.apply(await requestPromise)
+}
+
+// TODO: Find a better way to handle this instead of hardcoding.
+function correctAniMappings(opts) {
+  const id = Number(opts?.id)
+  return {
+    options: id === 210482 ? { ...opts, id: 190327 } : opts,
+    apply(mappings) {
+      const steelBallRun = id === 190327 || id === 210482
+      if (!steelBallRun || !mappings?.episodes) return mappings
+
+      // AniList splits Steel Ball Run after episode 1
+      const episodes = Object.fromEntries(Object.entries(mappings.episodes)
+        .filter(([key]) => id === 190327 ? key === '1' : Number.isInteger(Number(key)) && Number(key) > 1)
+        .map(([key, episode]) => {
+          const number = id === 190327 ? key : String(Number(key) - 1)
+          return [number, { ...episode, episode: number }]
+        }))
+      return { ...mappings, episodes, episodeCount: Object.keys(episodes).length, specialCount: 0 }
+    }
+  }
 }
 
 function checkError(error, type) {

@@ -1,15 +1,14 @@
 <script context='module'>
-    import { Download, CloudUpload, CloudDownload, FolderX, FolderCheck, TvMinimalPlay } from 'lucide-svelte'
+    import { Download, CloudUpload, CloudDownload, FolderX, FolderCheck, TvMinimalPlay, Loader2 } from 'lucide-svelte'
     import { settings } from '@/modules/settings.js'
-    import { add, stage, loadedTorrent, stagingTorrents, seedingTorrents, completedTorrents } from '@/modules/torrent.js'
-    import { getHash } from '@/modules/anime/animehash.js'
+    import { add, stage, loadedTorrent, stagingTorrents, seedingTorrents, completedTorrents, findTorrents } from '@/modules/torrent.js'
     import { handlePlay, handleAnime } from '@/modules/anime/anime.js'
     import { equalsIgnoreCase } from '@/modules/util.js'
     import { writable } from 'simple-store-svelte'
     import { click } from '@/modules/lib/click.js'
     import { toast } from '@/modules/lib/toast.js'
 
-    /** @type {import('simple-store-svelte').Writable<Map<string, { toastId: string, timeoutId: ReturnType<typeof setTimeout> }>>} */
+    /** @type {import('simple-store-svelte').Writable<Map<string, string>>} */
     const pendingToasts = writable(new Map())
 
     /**
@@ -23,7 +22,7 @@
      */
     export function playActive(hash, search, magnet, prompt = true) {
         const autoFile = settings.value.rssAutofile
-        const resolvedHash = getHash(search?.media?.id, { episode: search?.episode, client: true, batchGuess: true }, false, true)
+        const resolvedHash = findTorrents(search?.media?.id, search?.episode)[0]?.infoHash
         const activeHash = autoFile && getActiveHash([...(hash && !equalsIgnoreCase(hash, resolvedHash) ? [hash] : []), ...(resolvedHash ? [resolvedHash] : [])], false)
         if (activeHash && !equalsIgnoreCase(loadedTorrent.value?.infoHash, activeHash) && !equalsIgnoreCase(loadedTorrent.value?.fileHash, activeHash)) { // We have a cached and active hash with the requested media and episode, its predicted we should use this.
             add(activeHash, search, activeHash)
@@ -60,58 +59,66 @@
     }
 
     /**
-     * Stages a torrent for background download. Shows a loading toast that resolves once the hash
-     * appears in the loaded/staging/seeding/completed torrents, or errors out after 45 seconds.
+     * Stages a torrent for background download and confirms its presence in the manager.
+     * Metadata retrieval and file verification can continue while the torrent is listed.
      *
      * @param {string} torrentID
      * @param {object} search
      * @param {string|null} activeHash
+     * @returns {Promise<void>}
      */
-    export function queueTorrent(torrentID, search, activeHash) {
-        if (activeHash) {
-            const hashKey = activeHash.toLowerCase()
-            if (pendingToasts.value.has(hashKey)) return
-            const toastId = toast.loading('Queuing Torrent', { description: 'Requesting torrent for background download, this may take a moment...', duration: Infinity })
-            const timeoutId = setTimeout(() => {
-                const map = pendingToasts.value
-                if (!map.has(hashKey)) return
-                toast.update(toastId, { type: 'error', title: 'Failed to Queue Torrent', description: 'Torrent was not received after 45 seconds. Please try again.', duration: 6_000 })
-                const next = new Map(map)
-                next.delete(hashKey)
-                pendingToasts.set(next)
-            }, 45_000)
-            timeoutId.unref?.()
-            const next = new Map(pendingToasts.value)
-            next.set(hashKey, { toastId, timeoutId })
-            pendingToasts.set(next)
-        } else toast.info('Queued Torrent', { description: 'Torrent has been queued for background download. Check the management page for progress...', duration: 6_000 })
-        stage(torrentID, search, activeHash)
-    }
-
-    /**
-     * Resolves a pending toast into a success state and removes it from the pending map.
-     *
-     * @param {string} hashKey Lowercased info hash to resolve.
-     */
-    function resolvePending(hashKey) {
-        const map = pendingToasts.value
-        const entry = map.get(hashKey)
-        if (!entry) return
-        clearTimeout(entry.timeoutId)
-        toast.update(entry.toastId, { type: 'success', title: 'Queued Torrent', description: 'Torrent has been queued for background download. Check the management page for progress...', duration: 6_000 })
-        const next = new Map(map)
+    export async function queueTorrent(torrentID, search, activeHash) {
+        if (!torrentID) return
+        const hashKey = (activeHash || torrentID).toLowerCase()
+        if (pendingToasts.value.has(hashKey)) return
+        const toastId = toast.loading('Queuing Torrent', { description: 'Requesting torrent for background download, this may take a moment...', duration: Infinity })
+        pendingToasts.set(new Map(pendingToasts.value).set(hashKey, toastId))
+        try {
+            const torrent = await stage(torrentID, search, activeHash)
+            if (torrent) {
+                const resolvedHash = torrent.infoHash?.toLowerCase() || activeHash?.toLowerCase()
+                if (resolvedHash && resolvedHash !== hashKey && pendingToasts.value.has(hashKey)) {
+                    const next = new Map(pendingToasts.value)
+                    next.delete(hashKey)
+                    next.set(resolvedHash, toastId)
+                    pendingToasts.set(next)
+                }
+                checkPending(loadedTorrent.value)
+                checkPending(stagingTorrents.value)
+                checkPending(seedingTorrents.value)
+                checkPending(completedTorrents.value)
+                return
+            }
+            toast.update(toastId, { type: 'error', title: 'Failed to Queue Torrent', description: 'The torrent request could not be submitted. Please try again.', duration: 6_000 })
+        } catch (error) {
+            toast.update(toastId, { type: 'error', title: 'Failed to Queue Torrent', description: error?.message || String(error), duration: 6_000 })
+        }
+        const next = new Map(pendingToasts.value)
         next.delete(hashKey)
         pendingToasts.set(next)
     }
 
     /**
-     * Checks pending toasts against a store's new value, resolving any whose hash is now present.
-     *
-     * @param {object|object[]|null} value The updated store value (single torrent or list of torrents).
+     * Confirms a pending request after the manager receives its torrent.
+     * @param {string} hashKey Lowercase info hash or identifier.
+     * @returns {void}
+     */
+    function resolvePending(hashKey) {
+        const toastId = pendingToasts.value.get(hashKey)
+        if (!toastId) return
+        toast.update(toastId, { type: 'success', title: 'Queued Torrent', description: 'Torrent has been queued for background download. Check the management page for progress...', duration: 6_000 })
+        const next = new Map(pendingToasts.value)
+        next.delete(hashKey)
+        pendingToasts.set(next)
+    }
+
+    /**
+     * Uses the same torrent stores as the manager to confirm pending requests.
+     * @param {object|object[]|null} value Torrent snapshot or list.
+     * @returns {void}
      */
     function checkPending(value) {
         const list = Array.isArray(value) ? value : (value ? [value] : [])
-        if (list.length === 0) return
         for (const hashKey of pendingToasts.value.keys()) {
             if (list.some(torrent => equalsIgnoreCase(torrent.infoHash, hashKey))) resolvePending(hashKey)
         }
@@ -131,8 +138,22 @@
     $: disabled = ($seedingTorrents?.length + $stagingTorrents?.length + 1) >= settings.value.seedingLimit && !settings.value.torrentPersist
     $: activeHash = $loadedTorrent && $stagingTorrents && $seedingTorrents && $completedTorrents && (Array.isArray(hash) ? getActiveHash(hash) : hash)
     $: downloaded = ($completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) && !$completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete) || $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) || $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) || equalsIgnoreCase($loadedTorrent.infoHash, activeHash)
-    $: pending = $pendingToasts.has(activeHash?.toLowerCase())
+    $: activeTorrent = equalsIgnoreCase($loadedTorrent.infoHash, activeHash) ? $loadedTorrent : $stagingTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))
+    $: pending = $pendingToasts.has((activeHash || torrentID)?.toLowerCase()) || !!(activeTorrent?.resolving || activeTorrent?.verifying)
 </script>
-<button type='button' class='torrent-button d-flex align-items-center justify-content-center {$$restProps.class}' class:not-allowed={downloaded || disabled || pending} class:not-reactive={downloaded || disabled} class:cursor-wait={pending} disabled={(disabled && !downloaded) || pending} title='' data-toggle='tooltip' data-placement='left' data-title={pending ? 'Adding...' : $completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? ($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? 'Download Incomplete' : 'Download Completed') : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'Seeding...' : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'Downloading...' : equalsIgnoreCase($loadedTorrent.infoHash, activeHash) ? 'Now Playing' : (!disabled ? 'Queue for Download' : 'Enable Persist Files or Increase Seeding Limit')} use:click={() => { if (!disabled && !downloaded && torrentID) queueTorrent(torrentID, search, activeHash) }}>
-    <svelte:component this={$completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? ($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? FolderX : FolderCheck) : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? CloudUpload : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? CloudDownload : equalsIgnoreCase($loadedTorrent.infoHash, activeHash) ? TvMinimalPlay : Download} {size} {strokeWidth} style={downloaded ? (`color: ${$completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--gray-color-dim)' : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--success-color)' : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--warning-color)' : 'var(--tertiary-color)'}`) : (($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? 'color: var(--error-color-light)' : ''))} />
+<button type='button' class='torrent-button d-flex align-items-center justify-content-center {$$restProps.class}' class:not-allowed={downloaded || disabled || pending} class:not-reactive={downloaded || disabled} class:cursor-wait={pending} disabled={(disabled && !downloaded) || pending} title='' data-toggle='tooltip' data-placement='left' data-title={pending ? (activeTorrent?.resolving ? 'Resolving...' : activeTorrent?.verifying ? 'Verifying...' : 'Adding...') : $completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? ($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? 'Download Incomplete' : 'Download Completed') : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'Seeding...' : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'Downloading...' : equalsIgnoreCase($loadedTorrent.infoHash, activeHash) ? 'Now Playing' : (!disabled ? 'Queue for Download' : 'Enable Persist Files or Increase Seeding Limit')} use:click={() => { if (!disabled && !downloaded && torrentID) queueTorrent(torrentID, search, activeHash) }}>
+    {#if pending}
+        <Loader2 {size} {strokeWidth} class='torrent-spin' />
+    {:else}
+        <svelte:component this={$completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? ($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? FolderX : FolderCheck) : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? CloudUpload : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? CloudDownload : equalsIgnoreCase($loadedTorrent.infoHash, activeHash) ? TvMinimalPlay : Download} {size} {strokeWidth} style={downloaded ? (`color: ${$completedTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--slateblue-color)' : $seedingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--success-color)' : $stagingTorrents.some(torrent => equalsIgnoreCase(torrent.infoHash, activeHash)) ? 'var(--warning-color)' : 'var(--tertiary-color)'}`) : (($completedTorrents.find(torrent => equalsIgnoreCase(torrent.infoHash, activeHash))?.incomplete ? 'color: var(--error-color-light)' : ''))} />
+    {/if}
 </button>
+
+<style>
+    .torrent-button :global(.torrent-spin) {
+        animation: torrent-spin .9s linear infinite;
+    }
+    @keyframes torrent-spin {
+        to { transform: rotate(360deg); }
+    }
+</style>

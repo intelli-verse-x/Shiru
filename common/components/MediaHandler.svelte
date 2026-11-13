@@ -1,16 +1,16 @@
 <script context='module'>
   import { writable } from 'simple-store-svelte'
   import AnimeResolver from '@/modules/anime/animeresolver.js'
-  import { setHash, getHash, getId } from '@/modules/anime/animehash.js'
+  import { setTorrentMedia, findTorrents } from '@/modules/torrent.js'
   import { videoRx, matchPhrase, isValidNumber } from '@/modules/util.js'
   import { tick } from 'svelte'
   import { toast } from '@/modules/lib/toast.js'
   import { anilistClient } from '@/modules/providers/anilist/anilist.js'
   import { files as _files } from '@/modules/navigation.js'
-  import { mediaCache } from '@/modules/cache.js'
+  import { cache, mediaCache } from '@/modules/cache.js'
   import { episodesList } from '@/modules/episodes.js'
   import { settings } from '@/modules/settings.js'
-  import { getAniMappings, hasZeroEpisode } from '@/modules/anime/anime.js'
+  import { getAniMappings, hasZeroEpisode, anitomyscript } from '@/modules/anime/anime.js'
   import Debug from 'debug'
   const debug = Debug('ui:mediahandler')
 
@@ -53,7 +53,7 @@
     let targetFile = fileList.find(file => file.media?.media?.id === obj.media?.id && (Number(file.media?.parseObject?.episode_number || 0) === obj.episode || obj.media?.episodes === 1 || (!obj.media?.episodes && (obj.episode === 1 || !obj.episode) && (oldNowPlaying.episode === 1 || !oldNowPlaying.episode)))) // movie check
     if (!targetFile) targetFile = fileList.find(file => file.media?.media?.id === obj.media.id && (file.media?.episode === obj.episode || obj.media?.episodes === 1 || (!obj.media?.episodes && (obj.episode === 1 || !obj.episode) && (oldNowPlaying.episode === 1 || !oldNowPlaying.episode)))) // movie check
     if (!targetFile) {
-      const resolvedHash = getHash(obj.media?.id, { episode: obj.episode, client: true, batchGuess: true }, false, true)
+      const resolvedHash = findTorrents(obj.media?.id, obj.episode)[0]?.infoHash
       if (resolvedHash) { // We have a cached and active hash with the requested media and episode, its predicted we should use this.
           //add(resolvedHash, { media: obj.media, episode: obj.episode }, resolvedHash)
           window.dispatchEvent(new CustomEvent('add', { detail: { resolvedHash, search: { media: obj.media, episode: obj.episode } } })) // TODO: Circular Dependency (torrent.js)
@@ -98,7 +98,7 @@
   async function handleRanged({ detail: { current, duration } }) {
     if (duration && (duration > 120) && nowPlaying.value?.episode && nowPlaying.value?.media?.duration && !nowPlaying.value?.episodeRange) {
       // We need check the mappings to verify that the episode isn't actually an ultra-long premiere episode like "Oshi No Ko", Anilist doesn't differentiate these so we need to manually check.
-      const mappings = (!nowPlaying.value.media.episodes || !nowPlaying.value.media.episodes <= 100) && (await getAniMappings(nowPlaying.value.media.id) || {})?.episodes
+      const mappings = (!nowPlaying.value.media.episodes || !nowPlaying.value.media.episodes <= 100) && (await getAniMappings(nowPlaying.value.media) || {})?.episodes
       const episode = mappings && (mappings[nowPlaying.value.episode] || Object.values(mappings)?.find(episode => ((episode.episode || episode.episodeNumber) && Number((episode.episode || episode.episodeNumber))) === Number(nowPlaying.value.episode) && episode.length > 1))
       debug(`Duration of the current media has changed, checking for multiple episodes in the video file for: ${JSON.stringify(nowPlaying.value.parseObject)}`)
       const mediaDuration = (episode?.length && episode.length * 60) || (nowPlaying.value.media.duration * 60)
@@ -124,17 +124,7 @@
             parseObject: nowPlaying.value.parseObject,
             failed: nowPlaying.failed,
           })
-          setTimeout(() => {
-            setHash(current.infoHash, {
-              fileHash: current.fileHash,
-              mediaId: current.media.media.id,
-              episodeRange: current.media.episodeRange,
-              episode: current.media.episode || current.media.parseObject.episode_number,
-              season: current.media.season || current.media.parseObject.anime_season,
-              parseObject: current.media.parseObject,
-              failed: current.media.failed || current.media.parseObject.failed
-            })
-          })
+          setTorrentMedia(current.infoHash, { ...current.media, locked: !!(current.locked || current.media.locked) }, current.path)
         }
       }
     }
@@ -144,26 +134,30 @@
     if (opts?.media || opts?.episode || opts?.parseObject) {
       const { media, episode, episodeRange, parseObject } = opts
       const zeroEpisode = media && await checkForZero(media)
-      const ep = (Number(episode || parseObject?.episode_number) === 0) || (zeroEpisode && !episode) ? 0 : (Number(episode || parseObject?.episode_number) || null)
+      const episodeNumber = episode ?? parseObject?.episode_number
+      const ep = episodeNumber != null && Number.isFinite(Number(episodeNumber)) ? Number(episodeNumber) : null
       const streamingTitle = media?.streamingEpisodes?.find(episode => episodeRx.exec(episode.title) && Number(episodeRx.exec(episode.title)?.[1]) === ep)
       let streamingEpisode
+      let streamingArtwork = streamingTitle?.thumbnail
       if (!newPlaying && (!streamingEpisode || !episodeRx.exec(streamingEpisode.title) || episodeRx.exec(streamingEpisode.title)[2].toLowerCase()?.trim()?.startsWith('episode') || media?.streamingEpisodes?.find(episode => episodeRx.exec(episode.title) && Number(episodeRx.exec(episode.title)[1]) === (media?.episodes + 1)))) {
         // better episode title fetching, especially for "two cour" anime releases like Dead Mount Play... shocker, the anilist database for streamingEpisodes can be wrong!
-        const mappings = await getAniMappings(media?.id) || {}
-          if (/episode\s*0/i.test(mappings?.episodes?.[1]?.title?.en || mappings?.episodes?.[1]?.title?.jp)) {
-            delete mappings?.episodes?.[1]
-            mappings.episodes = Object.keys(mappings.episodes).sort((a, b) => a - b).reduce((acc, key, index) => {
-                acc[index + 1] = mappings.episodes?.[key]
-                return acc
-            }, {})
-          }
+        const mappings = await getAniMappings(media) || {}
+        if (/episode\s*0/i.test(mappings?.episodes?.[1]?.title?.en || mappings?.episodes?.[1]?.title?.jp)) {
+          delete mappings?.episodes?.[1]
+          mappings.episodes = Object.keys(mappings.episodes).sort((a, b) => a - b).reduce((acc, key, index) => {
+            acc[index + 1] = mappings.episodes?.[key]
+            return acc
+          }, {})
+        }
         const { episodes, specialCount, episodeCount } = mappings
-        let mappingsTitle = episode && episodes && episodes[Number(episode)]?.title?.en
+        const mappedEpisode = ep !== null && episodes ? episodes[ep] : null
+        const mappingsTitle = mappedEpisode?.title?.en
         // if (episode && (!mappingsTitle || mappingsTitle.length === 0)) {
         //   const kitsuMappings = (await getKitsuMappings(media?.id))?.data?.find(ep => ep?.attributes?.number === Number(episode))?.attributes
         //   mappingsTitle = kitsuMappings?.titles?.en_us || kitsuMappings?.titles?.en_jp || (episodes && episodes[Number(episode)]?.title?.jp)
         // }
-        const needsValidation = !(!specialCount || (media?.episodes === episodeCount && episodes && episodes[Number(episode)]))
+        const needsValidation = !(!specialCount || (media?.episodes === episodeCount && mappedEpisode))
+        if (!needsValidation || media?.status === 'FINISHED') streamingArtwork = mappedEpisode?.image || streamingArtwork
         streamingEpisode = (!needsValidation && mappingsTitle && episodeRx.exec(`Episode ${Number(episode)} - ` + mappingsTitle)) ? {title: (`Episode ${Number(episode)} - ` + mappingsTitle)} : (needsValidation && media?.status === 'FINISHED') ? {title: (`Episode ${Number(episode)} - ` + (mappingsTitle || `Episode ${Number(episode)}`))} : streamingTitle
         if (!streamingEpisode || !episodeRx.exec(streamingEpisode.title) || episodeRx.exec(streamingEpisode.title)[2].toLowerCase()?.trim()?.startsWith('episode')) {
           const episodeTitle = await episodesList.getSingleEpisode(media?.idMal, Number(episode)) // animappings sometimes doesn't have all the data, so we can use an alternative api to fetch episode information.,
@@ -176,6 +170,9 @@
         streamingEpisode.title = (titleParts?.[0]?.trim() === titleParts?.[1]?.trim()) ? titleParts?.[0]?.trim() : streamingEpisode.title
       }
 
+      const lastEpisode = (episodeRange || parseObject?.episodeRange)?.last || (isValidNumber(ep) && (ep + (zeroEpisode ? 1 : 0))) || (media?.episodes === 1 && media?.episodes)
+      const hasSpoiler = settings.value.spoilerStatus.includes(media?.mediaListEntry?.status ?? 'NOTONLIST')
+      const isSpoiler = hasSpoiler && (media?.mediaListEntry?.progress ?? 0) < lastEpisode
       const foundEpisodeTitle = (streamingEpisode && (episodeRx.exec(streamingEpisode.title)?.[2] || episodeRx.exec(streamingEpisode.title))) || ((media?.format === 'MOVIE' && (media?.episodes ?? 0) <= 1) ? 'The Movie' : '')
       const details = {
         title: anilistClient.title(media) || parseObject?.anime_title || parseObject?.file_name,
@@ -183,15 +180,16 @@
         episode: ep,
         episodeRange,
         episodeTitle: foundEpisodeTitle && media?.episodes === 1 && (foundEpisodeTitle.match(/ web|web |movie/i) || foundEpisodeTitle.toLowerCase() === 'web') ? 'The Movie' : foundEpisodeTitle,
-        thumbnail: media?.coverImage?.extraLarge
+        thumbnail: media?.coverImage?.extraLarge,
+        artwork: (!(isSpoiler && ['minimal', 'moderate', 'strict', 'hermit'].includes(settings.value.spoilers)) && streamingArtwork) || media?.coverImage?.extraLarge || (media?.trailer?.id && `https://i.ytimg.com/vi/${media?.trailer?.id}/hqdefault.jpg`) || media?.bannerImage
       }
 
       nowPlaying.set({
-          ...(newPlaying ? newPlaying : {}),
-          media,
-          parseObject,
-          failed: opts.failed || parseObject?.failed,
-          ...details
+        ...(newPlaying || {}),
+        media,
+        parseObject,
+        failed: opts.failed || parseObject?.failed,
+        ...details
       })
       if (!newPlaying) setMediaSession(nowPlaying.value)
       debug(`Now playing as been set to: ${JSON.stringify(details)}`)
@@ -288,7 +286,10 @@
   function cleanFiles(videoFiles) {
     // Kiss X Sis fix, release group specified OVA and TV without the TV tag, making this unresolvable unless we correct.
     if (videoFiles.some(file => matchPhrase(AnimeResolver.cleanFileName(file.name), ['Kiss X Sis OVA', 'KissXSis OVA', 'Kiss×Sis OVA'], 0.3, false))
-        && videoFiles.some(file => !matchPhrase(AnimeResolver.cleanFileName(file.name), ['Kiss X Sis OVA', 'KissXSis OVA', 'Kiss×Sis OVA'], 0.3, false && matchPhrase(AnimeResolver.cleanFileName(file.name), ['Kiss X Sis', 'KissXSis', 'Kiss×Sis'], 0.3, false)))) {
+      && videoFiles.some(file => {
+        const name = AnimeResolver.cleanFileName(file.name)
+        return !matchPhrase(name, ['Kiss X Sis OVA', 'KissXSis OVA', 'Kiss×Sis OVA'], 0.3, false) && matchPhrase(name, ['Kiss X Sis', 'KissXSis', 'Kiss×Sis'], 0.3, false)
+      })) {
         videoFiles.forEach(file => {
             if (videoFiles.some(file => matchPhrase(AnimeResolver.cleanFileName(file.name), ['Kiss X Sis OVA', 'KissXSis OVA', 'Kiss×Sis OVA'], 0.3, false))) {
                 file.name = file.name.replace(/Kiss[ ×]?X[ ×]?Sis[ ]?OVA/i, 'Kiss×Sis')
@@ -321,14 +322,23 @@
     }
     videoFiles = cleanFiles(videoFiles)
 
-    // assign any resolved media to their video files that haven't failed to be resolved.
+    // Reuse each file's saved media data.
     let resolved = []
-    for (const file of videoFiles) {
-        const cached = getId(file.infoHash, { fileHash: file.fileHash })
-        if (cached && cached.mediaId && mediaCache.value[cached.mediaId]) file.media = { ...cached, failed: cached.failed || cached.parseObject?.failed, media: mediaCache.value[cached.mediaId] }
-    }
+    const parsedFiles = videoFiles.some(file => file.mediaData?.anilist_id) ? await anitomyscript(videoFiles.map(file => file.name)).catch(error => { debug(error); return [] }) : []
+    await Promise.all(videoFiles.map(async (file, index) => {
+        if (!file.media?.media?.id) delete file.media
+        if (!file.mediaData?.anilist_id) return
+        const saved = file.mediaData
+        const media = await cache.requestMedia(saved.anilist_id).catch(() => null)
+        if (!media?.id) return
+        file.media = {
+            ...saved,
+            media,
+            parseObject: { ...parsedFiles[index], file_name: file.name, episode_number: saved.episode, episodeRange: saved.episodeRange, anime_season: saved.season }
+        }
+    }))
 
-    let uncachedMedia = videoFiles.filter(file => !file.media)
+    const uncachedMedia = videoFiles.filter(file => !file.media)
     if (uncachedMedia?.length) {
         try {
             resolved = await AnimeResolver.resolveFileAnime(uncachedMedia.map(file => file.name))
@@ -338,18 +348,11 @@
     }
 
     if (resolved?.length) {
-        videoFiles.forEach((file) => {
+        uncachedMedia.forEach((file) => {
             const parseObject = resolved.find(({parseObject}) => AnimeResolver.cleanFileName(file.name).includes(parseObject.file_name))
             if (parseObject && !parseObject.failed) {
                 file.media = parseObject
-                 setHash(file.infoHash, {
-                     fileHash: file.fileHash,
-                     mediaId: parseObject.media?.id,
-                     episode: parseObject.episode,
-                     season: parseObject.season,
-                     parseObject: parseObject.parseObject,
-                     failed: parseObject.failed
-                 })
+                 setTorrentMedia(file.infoHash, file.media, file.path)
             }
         })
     }
@@ -384,14 +387,7 @@
             if (parseObject?.episode && (String(parseObject?.episode || '') === String(failedEntry?.parseObject?.video_resolution || '').replace('p', ''))) delete parseObject.episode
           }
           file.media = parseObject
-          setHash(file.infoHash, {
-            fileHash: file.fileHash,
-            mediaId: parseObject.media?.id,
-            episode: parseObject.episode,
-            season: parseObject.season,
-            parseObject: parseObject.parseObject,
-            failed: parseObject.failed
-          })
+          setTorrentMedia(file.infoHash, file.media, file.path)
         }
       })
     }
@@ -404,6 +400,9 @@
             if (parseObject) file.media = { parseObject: { ...parseObject }, ...(parseObject?.episode_number ? { episode: parseObject?.episode_number ? Number(parseObject.episode_number) : 1 } : {}), ...(parseObject?.anime_season ? { season: parseObject?.anime_season ? Number(parseObject.anime_season) : 1 } : {}), failed: true }
         })
     }
+    for (const file of failedToResolve) {
+        setTorrentMedia(file.infoHash, { ...file.media, failed: true }, file.path)
+    }
     videoFiles?.sort((a, b) => a.media?.media?.id - b.media?.media?.id) // group media ids together for easier readability.
     debug(`Resolved ${videoFiles?.length} video files`, fileListToDebug(videoFiles))
 
@@ -412,7 +411,7 @@
       videoFiles = videoFiles.filter(file => {
           if (typeof file.media?.parseObject?.anime_type === 'string') return !TYPE_EXCLUSIONS.includes(file.media?.parseObject?.anime_type.toUpperCase())
           else if (Array.isArray(file.media?.parseObject?.anime_type)) { // rare edge cases where the type is an array, only batches like a full season + movie + special.
-              for (let animeType of file.media?.parseObject?.anime_type) {
+              for (const animeType of file.media.parseObject.anime_type) {
                   if (TYPE_EXCLUSIONS.includes(animeType.toUpperCase())) return false
               }
           } else if (!file.media?.parseObject?.anime_type) { // Could be hit-miss but its really down to release groups using proper file names
@@ -488,7 +487,7 @@
   // map the episode and season by attempting to fetch them from the title, should only occur in when there is a severe error in media resolving.
   const remapByTitle = (arr = []) => {
       return arr.map((el) => {
-          if (!el.media?.episode) {
+          if (!el.mediaData && !el.media?.episode) {
               const matches = el.media?.parseObject?.anime_title?.match(/(\d{2})/g)
               if (matches && matches.length > 0) {
                   const seasonNumber = matches[0]

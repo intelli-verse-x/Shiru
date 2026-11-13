@@ -1,11 +1,14 @@
 import { SUPPORTS } from '@/modules/support.js'
-import { ANDROID } from '@/modules/bridge.js'
+import { ANDROID, ELECTRON } from '@/modules/bridge.js'
 
 let lastTapElement = null
 let lastTapTarget = null
 let lastTapCurrent = null
 let lastHoverElement = null
 let lastInteractionMethod = 'mouse'
+let lastPointerType = 'mouse'
+let lastTouchPosition = null
+let contextSelectionRegion = null
 
 const noop = _ => {}
 
@@ -18,13 +21,23 @@ export function getInteractionMethod() {
   return lastInteractionMethod
 }
 
-document.addEventListener('mousedown', () => lastInteractionMethod = 'mouse')
-document.addEventListener('touchstart', () => lastInteractionMethod = 'touch', { passive: true })
+document.addEventListener('mousedown', () => (lastInteractionMethod = 'mouse'))
+document.addEventListener('touchstart', () => (lastInteractionMethod = 'touch'), { passive: true })
+document.addEventListener('pointermove', (e) => (lastPointerType = e.pointerType), true)
+document.addEventListener('pointerdown', (e) => {
+  lastPointerType = e.pointerType
+  if (e.pointerType === 'touch') lastTouchPosition = { x: e.clientX, y: e.clientY }
+  if (e.pointerType !== 'touch' || !lastTapCurrent || !e.target || lastTapCurrent.contains(e.target)) return
+  const tappedElement = lastTapElement
+  tappedElement?.(false)
+  if (lastHoverElement !== tappedElement) lastHoverElement?.(false)
+  lastTapElement = null
+  lastHoverElement = null
+  lastTapCurrent = null
+  lastTapTarget = null
+}, true)
 document.addEventListener('focusin', (e) => {
   if (lastInteractionMethod !== 'dpad') return
-  const activeEl = document.activeElement
-  const isTextInput = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)
-  if (!isTextInput && !e.target?.closest('.select-all')) window.getSelection()?.removeAllRanges()
   if (lastTapTarget !== e.target && (!lastTapCurrent || !e.target || !lastTapCurrent.contains(e.target))) {
     lastTapElement?.(false)
     lastTapElement = null
@@ -36,6 +49,14 @@ document.addEventListener('focusin', (e) => {
 })
 
 document.addEventListener('pointercancel', (e) => {
+  if (e.pointerType === 'touch') {
+    // Dismiss hover when scrolling takes over but not for small movements.
+    lastPointerType = 'touch'
+    const hoveredElement = lastHoverElement
+    lastHoverElement = null
+    if (hoveredElement !== lastTapElement) hoveredElement?.(false)
+    if (!lastTapElement) lastTapCurrent = null
+  }
   if (lastTapTarget !== e.target && (!lastTapCurrent || !e.target || !lastTapCurrent.contains(e.target))) {
     lastTapElement?.(false)
     lastTapElement = null
@@ -44,20 +65,79 @@ document.addEventListener('pointercancel', (e) => {
     lastTapCurrent = null
     lastTapTarget = null
   }
-})
+}, true)
 
-document.addEventListener('selectionchange', () => {
-  const activeEl = document.activeElement
-  const isTextInput = activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable)
-  if (!isTextInput && (window.getSelection()?.toString()?.trim() === '')) window.getSelection()?.removeAllRanges()
-})
+// Dismiss hover previews when scrolling carousels
+document.addEventListener('scroll', (e) => {
+  if (lastPointerType !== 'touch' || !lastTouchPosition || !lastTapCurrent || !e.target?.contains(lastTapCurrent)) return
+  const rect = lastTapCurrent.getBoundingClientRect()
+  const bounds = e.target === document ? { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight } : e.target.getBoundingClientRect()
+  const visible = rect.right > Math.max(0, bounds.left) && rect.left < Math.min(window.innerWidth, bounds.right) && rect.bottom > Math.max(0, bounds.top) && rect.top < Math.min(window.innerHeight, bounds.bottom)
+  if (visible && lastTapCurrent.contains(document.elementFromPoint(lastTouchPosition.x, lastTouchPosition.y))) return
+  const tappedElement = lastTapElement
+  tappedElement?.(false)
+  if (lastHoverElement !== tappedElement) lastHoverElement?.(false)
+  lastTapElement = null
+  lastHoverElement = null
+  lastTapCurrent = null
+  lastTapTarget = null
+}, { capture: true, passive: true })
+
+// handles text selection/deselection
+if (!SUPPORTS.isAndroid) {
+  ELECTRON?.onSelectContextText?.(() => {
+    if (!contextSelectionRegion?.isConnected) return
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.selectAllChildren(contextSelectionRegion)
+  })
+  document.addEventListener('contextmenu', (e) => {
+    if (!ELECTRON?.showTextContextMenu || !e.target?.closest) return
+    const textField = e.target.closest(`input:not(:is([type='button'], [type='submit'], [type='reset'], [type='checkbox'], [type='radio'], [type='range'], [type='color'], [type='file'], [type='image'])), textarea, [contenteditable]:not([contenteditable='false'])`)
+    const selectionRegion = textField || e.target.closest('.select-text')
+    if (!selectionRegion) return
+    if (!textField) {
+      const excludedTarget = e.target.closest(`a[href], button, input, label, select, option, summary, [role='button'], [role='menuitem'], [draggable='true'], [controls], .pointer, .grab, .touch-none, img, svg`)
+      if (excludedTarget && selectionRegion.contains(excludedTarget) && excludedTarget !== selectionRegion) return
+    }
+
+    let hasSelection
+    if (textField instanceof HTMLInputElement || textField instanceof HTMLTextAreaElement) {
+      hasSelection = textField.selectionStart !== null && textField.selectionEnd > textField.selectionStart
+    } else {
+      const selection = window.getSelection()
+      hasSelection = Boolean(selection?.toString().trim() && Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index)).some(range => range.intersectsNode(e.target)))
+    }
+
+    const editable = textField && !textField.matches(`:disabled, [readonly], [contenteditable='false']`)
+    contextSelectionRegion = textField ? null : selectionRegion
+
+    e.preventDefault()
+    e.stopPropagation()
+    ELECTRON.showTextContextMenu({
+      editable: Boolean(editable),
+      textField: Boolean(textField),
+      hasSelection,
+      canUndo: Boolean(editable && document.queryCommandEnabled('undo')),
+      canRedo: Boolean(editable && document.queryCommandEnabled('redo'))
+    })
+  }, true)
+}
+document.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || !e.target?.closest) return
+  const selectionRegion = e.target.closest('.select-text')
+  const excludedTarget = e.target.closest(`a[href], button, input, label, select, option, summary, [role='button'], [role='menuitem'], [draggable='true'], [controls], .pointer, .grab, .touch-none, img, svg`)
+  if (!selectionRegion || (excludedTarget && excludedTarget !== selectionRegion && selectionRegion.contains(excludedTarget))) {
+    window.getSelection()?.removeAllRanges()
+  }
+}, true)
 
 if (SUPPORTS.isAndroid) {
   document.addEventListener('touchstart', ANDROID.hideStatusBar, { passive: true })
 } else {
   // don't focus what we can't even tab to, fixes function keys being used to focus.
   document.addEventListener('focusin', (e) => {
-    if (e.target.getAttribute('tabindex') === '-1' && !e.target.draggable) e.target.blur()
+    if (['keyboard', 'dpad'].includes(lastInteractionMethod) && e.target.getAttribute('tabindex') === '-1' && !e.target.draggable) e.target.blur()
   }, true)
 }
 /** @typedef {{element: Element, x: number, y: number, inViewport: boolean}} ElementPosition  */
@@ -125,24 +205,31 @@ export function focus(node, focusUpdate = noop) {
   node.role = 'button'
   let focusTimeout
   let blurTimeout
+  let active = false
   function clearTimeouts() {
     clearTimeout(focusTimeout)
     clearTimeout(blurTimeout)
   }
+  function deactivate() {
+    if (!active) return
+    active = false
+    clearTimeouts()
+    focusUpdate(false)
+    lastTapElement = null
+    lastTapCurrent = null
+    document.removeEventListener('pointerup', handleOutsideClick, true)
+  }
   function handleOutsideClick(e) {
     const focused = e.target
     if (node && focused?.offsetParent != null && !node.contains(focused)) {
-      clearTimeouts()
-      focusUpdate(false)
-      lastTapElement = null
-      lastTapCurrent = null
-      document.removeEventListener('pointerup', handleOutsideClick)
+      deactivate()
     }
   }
   node.addEventListener('pointerleave', clearTimeouts)
   node.addEventListener('focus', () => {
     clearTimeouts()
-    document.addEventListener('pointerup', handleOutsideClick)
+    active = true
+    document.addEventListener('pointerup', handleOutsideClick, true)
     focusTimeout = setTimeout(() => focusUpdate(true), 800)
     focusTimeout.unref?.()
   })
@@ -151,10 +238,7 @@ export function focus(node, focusUpdate = noop) {
     blurTimeout = setTimeout(() => {
       const focused = document.activeElement
       if (node && focused?.offsetParent != null && !node.contains(focused)) {
-        focusUpdate(false)
-        lastTapElement = null
-        lastTapCurrent = null
-        document.removeEventListener('pointerup', handleOutsideClick)
+        deactivate()
       }
     })
     blurTimeout.unref?.()
@@ -167,21 +251,20 @@ export function focus(node, focusUpdate = noop) {
  * @param {Function} [hoverUpdate=noop] - The callback function to be executed on hover.
  */
 export function hover(node, hoverUpdate = noop) {
-  let pointerType = 'touch'
   if (!node.hasAttribute('tabindex')) node.tabIndex = 0
   node.role = 'button'
-  node.addEventListener('pointerenter', e => {
-    if (e.pointerType !== 'touch') {
+  function handleHover(e) {
+    if (e.pointerType !== 'touch' && lastPointerType !== 'touch' && lastHoverElement !== hoverUpdate) {
       if (!node.contains(e.target)) {
         lastHoverElement?.(false)
         lastTapElement?.(false)
       }
-      hoverUpdate(true)
+      if (lastTapElement !== hoverUpdate) hoverUpdate(true)
       lastHoverElement = hoverUpdate
       lastTapCurrent = e.currentTarget
-      pointerType = e.pointerType
     }
-  })
+  }
+  node.addEventListener('pointermove', handleHover)
   node.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
       e.stopPropagation()
@@ -195,8 +278,12 @@ export function hover(node, hoverUpdate = noop) {
     }
   })
   node.addEventListener('pointerleave', e => {
-    lastHoverElement = hoverUpdate
-    if (e.pointerType === 'mouse') hoverUpdate(false)
+    if (e.pointerType === 'touch' || lastPointerType === 'touch') return
+    if (lastHoverElement === hoverUpdate) {
+      lastHoverElement = null
+      if (!lastTapElement) lastTapCurrent = null
+    }
+    if (e.pointerType === 'mouse' || lastTapElement !== hoverUpdate) hoverUpdate(false)
   })
   node.addEventListener('pointerup', e => {
     if (e.pointerType === 'touch' && (!lastTapCurrent || !lastTapCurrent.contains(e.target))) {
@@ -219,60 +306,93 @@ export function hover(node, hoverUpdate = noop) {
 /**
  * Adds hover and click event listeners to the specified node.
  * @param {HTMLElement} node - The node to attach the event listeners to.
- * @param {Function} [cb=noop] - The callback function to be executed on click.
+ * @param {Function} [cb=noop] - The callback function to be executed on click. Return false to keep the preview open.
  * @param {Function} [hoverUpdate=noop] - The callback function to be executed on hover.
  * @param {Function} [rcb=noop] - The callback function to be executed on right-click (alt click).
  */
-export function hoverClick(node, [cb = noop, hoverUpdate = noop, rcb = noop]) {
+export function hoverClick(node, [cb = noop, hoverUpdate = noop, rcb = noop, enterClick = false]) {
   let pointerType = 'touch'
+  let penClickPending = false
   if (!node.hasAttribute('tabindex')) node.tabIndex = 0
   node.role = 'button'
   function handleOutsideClick(e) {
     const focused = e.target
     if (node && focused?.offsetParent != null && !node.contains(focused)) {
+      penClickPending = false
       hoverUpdate(false)
       lastTapElement = null
       lastHoverElement = null
       document.removeEventListener('pointerup', handleOutsideClick)
     }
   }
-  node.addEventListener('pointerenter', e => {
-    if (e.pointerType !== 'touch') {
+  function handleHover(e) {
+    if (e.pointerType !== 'touch' && lastPointerType !== 'touch' && lastHoverElement !== hoverUpdate) {
       if (!node.contains(e.target)) {
         lastHoverElement?.(false)
         lastTapElement?.(false)
       }
-      hoverUpdate(true)
+      if (lastTapElement !== hoverUpdate) hoverUpdate(true)
       document.addEventListener('pointerup', handleOutsideClick)
       lastHoverElement = hoverUpdate
       lastTapCurrent = e.currentTarget
       pointerType = e.pointerType
     }
+  }
+  node.addEventListener('pointermove', handleHover)
+  node.addEventListener('pointerdown', e => {
+    pointerType = e.pointerType
+    penClickPending = e.pointerType === 'pen' && e.button === 0
   })
+  node.addEventListener('click', () => (penClickPending = false), true)
+  node.addEventListener('pointercancel', () => (penClickPending = false), true)
   node.addEventListener('click', e => {
     e.stopPropagation()
-    if (pointerType === 'mouse') return cb(e)
-    lastTapElement?.(false)
-    if (lastTapElement === hoverUpdate) {
+    if (pointerType !== 'touch' || lastTapElement === hoverUpdate || lastHoverElement === hoverUpdate) {
+      if (cb(e) === false) {
+        if (lastTapElement !== hoverUpdate && lastHoverElement !== hoverUpdate) hoverUpdate(true, true)
+        lastTapElement = hoverUpdate
+        lastTapTarget = e.target
+        lastTapCurrent = e.currentTarget
+        document.addEventListener('pointerup', handleOutsideClick)
+        return
+      }
+      if (lastTapElement !== hoverUpdate) lastTapElement?.(false)
       lastTapElement = null
-      navigator.vibrate(15)
+      if (lastHoverElement === hoverUpdate) lastHoverElement = null
+      lastTapCurrent = null
+      lastTapTarget = null
+      if (pointerType === 'touch') navigator.vibrate(15)
       hoverUpdate(false)
       document.removeEventListener('pointerup', handleOutsideClick)
-      cb(e)
     } else {
+      lastTapElement?.(false)
       hoverUpdate(true, true)
       document.addEventListener('pointerup', handleOutsideClick)
       lastTapElement = hoverUpdate
       lastTapTarget = e.target
+      lastTapCurrent = e.currentTarget
     }
   })
   node.addEventListener('contextmenu', e => {
+    penClickPending = false
     e.preventDefault()
     rcb(e)
   })
   node.addEventListener('keydown', e => {
     if (e.key === 'Enter') {
       e.stopPropagation()
+      if (enterClick && e.target === node) {
+        e.preventDefault()
+        lastTapElement?.(false)
+        lastTapElement = null
+        if (lastHoverElement === hoverUpdate) lastHoverElement = null
+        lastTapCurrent = null
+        lastTapTarget = null
+        hoverUpdate(false)
+        document.removeEventListener('pointerup', handleOutsideClick)
+        cb(e)
+        return
+      }
       lastTapElement?.(false)
       if (lastTapElement === hoverUpdate) {
         lastTapElement = null
@@ -285,17 +405,17 @@ export function hoverClick(node, [cb = noop, hoverUpdate = noop, rcb = noop]) {
     }
   })
   node.addEventListener('pointerup', e => {
-    if (e.pointerType === 'mouse') {
-      e.stopPropagation()
-      setTimeout(() => {
-        hoverUpdate(false)
-        document.removeEventListener('pointerup', handleOutsideClick)
-      })
-    }
+    if (e.pointerType !== 'touch') e.stopPropagation()
   })
   node.addEventListener('pointerleave', e => {
-    lastHoverElement = hoverUpdate
-    if (e.pointerType === 'mouse') {
+    if (e.pointerType === 'touch' || lastPointerType === 'touch') return
+    // A pen release can leave hover range before its click is dispatched.
+    if (penClickPending) return
+    if (lastHoverElement === hoverUpdate) {
+      lastHoverElement = null
+      if (!lastTapElement) lastTapCurrent = null
+    }
+    if (e.pointerType === 'mouse' || lastTapElement !== hoverUpdate) {
       hoverUpdate(false)
       document.removeEventListener('pointerup', handleOutsideClick)
     }
@@ -347,7 +467,7 @@ export function drag(node, dp = noop) {
 export function dragScroll(node) {
   let dragging = false
   let activePointer = null
-  let threshold = 50
+  const threshold = 50
   let dragged = false
   let draggedX = 0
   let draggedY = 0
@@ -369,8 +489,8 @@ export function dragScroll(node) {
     }
     dragging = false
   }, opts)
-  node.addEventListener('mouseleave', () => dragging = false, opts)
-  node.addEventListener('pointerdown', e => activePointer = e.pointerId, opts)
+  node.addEventListener('mouseleave', () => (dragging = false), opts)
+  node.addEventListener('pointerdown', e => (activePointer = e.pointerId), opts)
   node.addEventListener('mouseup', () => {
     if (dragging && activePointer) {
       node.style.removeProperty('cursor')
@@ -382,7 +502,7 @@ export function dragScroll(node) {
     if (dragging && dragged) {
       suppressClick = true
       e.stopPropagation()
-      setTimeout(() => suppressClick = false).unref?.()
+      setTimeout(() => (suppressClick = false)).unref?.()
     }
     if (dragging && activePointer) {
       node.style.removeProperty('cursor')

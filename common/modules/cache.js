@@ -1,5 +1,6 @@
-import { generalDefaults, historyDefaults, extensionDefaults, notifyDefaults, isValidNumber, getRandomInt, generateRandomHexCode } from './util.js'
+import { generalDefaults, historyDefaults, extensionDefaults, notifyDefaults, isValidNumber, getRandomInt, generateRandomHexCode, getTorrentSettings } from '@/modules/util.js'
 import { writable } from 'simple-store-svelte'
+import { TORRENT } from '@/modules/bridge.js'
 import equal from 'fast-deep-equal/es6'
 import rfdc from 'rfdc'
 import Debug from 'debug'
@@ -11,7 +12,7 @@ const SHARED_DB_NAME = 'shiru-shared'
 /** @type {Map<string, Promise<IDBDatabase>>} */
 const openDBs = new Map()
 /** @type {number} */
-const version = 2 // DONT TOUCH THIS
+const version = 3 // DONT TOUCH THIS
 /** @type {import('simple-store-svelte').Writable<string|null>} */
 export const migrationStatus = writable(null)
 
@@ -46,6 +47,9 @@ const extractUserFields = (media) => ({ ...(media.mediaListEntry && { mediaListE
  * @type {Map<string, object>}
  */
 const batchWriters = new Map()
+
+/** Internal marker for cache deletions queued alongside writes. */
+const DELETE_ENTRY = Symbol('deleteEntry')
 
 /**
  * A collection of cache configurations used in the application.
@@ -83,11 +87,12 @@ export const caches = Object.freeze({
 function open(dbName) {
   if (!openDBs.has(dbName)) {
     let migration = Promise.resolve()
+    let migrationError
     openDBs.set(dbName, new Promise((resolve, reject) => {
       const request = indexedDB.open(String(dbName), version)
       request.onerror = (event) => {
         openDBs.delete(dbName)
-        reject(event.target.error)
+        reject(migrationError || event.target.error)
       }
       request.onsuccess = async (event) => {
         await migration
@@ -102,7 +107,14 @@ function open(dbName) {
           if (!!shared === isShared && !database.objectStoreNames.contains(key)) database.createObjectStore(key, { keyPath: 'key' })
         }
         if (oldVersion > 0 && oldVersion < version) migrationStatus.set('Getting everything ready, this may take a moment...')
-        if (!isShared && oldVersion === 1) migration = UPGRADE_V1_TO_V2(database, versionTx)
+        if (!isShared && oldVersion > 0 && oldVersion < 3) {
+          const previous = oldVersion === 1 ? UPGRADE_V1_TO_V2(database, versionTx) : Promise.resolve()
+          migration = UPGRADE_V2_TO_V3(database, versionTx, previous).catch(error => {
+            migrationError = error
+            migrationStatus.set(`Could not migrate cached media: ${error.message}`)
+            try { versionTx.abort() } catch {} // A failed request may have already aborted the upgrade.
+          })
+        }
       }
     }))
   }
@@ -157,7 +169,8 @@ async function get(dbName, cache, key) {
 async function set(dbName, cache, key, value) {
   const database = await open(dbName)
   const transaction = database.transaction(cache.key, 'readwrite')
-  await wrapRequest(transaction.objectStore(cache.key).put({ key, value }))
+  transaction.objectStore(cache.key).put({ key, value })
+  await waitForTransaction(transaction)
 }
 
 /**
@@ -170,11 +183,9 @@ async function set(dbName, cache, key, value) {
  */
 async function remove(dbName, cache, keys) {
   if (!keys || keys.length === 0) return
-  const database = await open(dbName)
-  const transaction = database.transaction(cache.key, 'readwrite')
-  const objectStore = transaction.objectStore(cache.key)
-  keys.forEach(key => objectStore.delete(key))
-  return waitForTransaction(transaction)
+  const batchWriter = getBatchWriter(dbName)
+  keys.forEach(key => batchWriter.enqueue(cache, key, DELETE_ENTRY))
+  return batchWriter.flushNow()
 }
 
 /**
@@ -239,7 +250,7 @@ async function putMany(dbName, cache, entries) {
  */
 async function recoverCache(dbName, cache) {
   const recovered = {}
-  let corruptedKeys = []
+  const corruptedKeys = []
   try {
     const database = await open(dbName)
     const transaction = database.transaction(cache.key, 'readonly')
@@ -316,7 +327,7 @@ function readAllFrom(source, storeKey) {
 }
 
 /**
- * Creates a batch writer for a given user that buffers cache writes and flushes them to IndexedDB after a delay.
+ * Creates a batch writer for a given user that buffers cache writes and deletions and flushes them to IndexedDB after a delay.
  *
  * This groups multiple writes into a single IndexedDB transaction and retries failed writes by re-enqueuing them.
  *
@@ -330,6 +341,7 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
   const pending = new Map()
   const retryMap = new Map()
   let flushTimer = null
+  let flushPromise = Promise.resolve()
   let batchAt = null
   let initialFlush = true
 
@@ -342,7 +354,7 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
   setInterval(resetRetries, resetDelay).unref?.()
 
   /**
-   * Flushes all queued writes to IndexedDB in a single transaction.
+   * Flushes all queued writes and deletions to IndexedDB in a single transaction.
    * If an error occurs, re-enqueues the writes for retry.
    */
   async function flush() {
@@ -360,12 +372,16 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
       try {
         const transaction = database.transaction(cacheKey, 'readwrite')
         const store = transaction.objectStore(cacheKey)
-        for (const [key, value] of kvMap.entries()) store.put({ key, value })
+        for (const [key, value] of kvMap.entries()) {
+          if (value === DELETE_ENTRY) store.delete(key)
+          else store.put({ key, value })
+        }
         await waitForTransaction(transaction)
         debug(`Flushed ${kvMap.size} entries to ${cacheKey}`)
       } catch (error) {
         debug(`Failed to flush ${cacheKey}, will retry`, error)
         for (const [key, value] of kvMap) {
+          if (pending.get(cacheKey)?.has(key)) continue // A newer write or deletion supersedes this failed operation.
           const mapKey = `${cacheKey}:${key}`
           const attempts = retryMap.get(mapKey) || 0
           if (attempts < 3) {
@@ -377,14 +393,25 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
     }
   }
 
+  /**
+   * Queues an immediate flush after any in-progress flush completes.
+   *
+   * @returns {Promise<void>} Resolves once this flush has completed.
+   */
+  function flushNow() {
+    const nextFlush = flushPromise.then(flush)
+    flushPromise = nextFlush.catch(() => {})
+    return nextFlush
+  }
+
   return {
     /**
-     * Enqueues a cache entry for a specific cache and key.
+     * Enqueues a cache write or deletion for a specific cache and key.
      * Starts the flush timer if this is the first entry in the batch.
      *
      * @param {keyof typeof caches} cache The name of the cache (object store).
      * @param {string|number} key The key to store in the cache.
-     * @param {*} value The value to store.
+     * @param {*} value The value to store, or DELETE_ENTRY to delete the key.
      */
     enqueue(cache, key, value) {
       const cacheKey = cache.key
@@ -393,7 +420,7 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
       if (!batchAt) {
         batchAt = Date.now()
         flushTimer = setTimeout(() => {
-          flush().finally(() => {
+          flushNow().finally(() => {
             flushTimer = null
             batchAt = null
           })
@@ -405,7 +432,7 @@ function createBatchWriter(dbName, firstFlushDelay = 10_000, subsequentFlushDela
      * Immediately flushes all queued cache entries to IndexedDB.
      */
     async flushNow() {
-      await flush()
+      await flushNow()
     },
     /**
      * Returns the total number of queued cache entries across all caches.
@@ -612,7 +639,7 @@ class Cache {
      */
     const run = async () => {
       if (running || timeout) return
-      if (this.status?.value?.match(/offline/i) || (this.page?.value === this.page?.PLAYER && document.fullscreenElement)) {
+      if (this.status?.value === 'offline' || (this.page?.value === this.page?.PLAYER && document.fullscreenElement)) {
         debug('Eviction: Skipping run, offline or player is fullscreen, retrying in 30s')
         timeout = setTimeout(() => {
           timeout = null
@@ -645,22 +672,22 @@ class Cache {
     await open(this.cacheID)
     const cacheTypes = [
       // USER DB
-      { key: caches.GENERAL, writable: (data) => this.general = writable({ ...generalDefaults, ...deepClone(data) }) },
-      { key: caches.USER_LISTS, writable: (data) => this.user_lists = writable(deepClone(data)) },
-      { key: caches.HISTORY, writable: (data) => this.history = writable({ ...historyDefaults, ...deepClone(data) }) },
-      { key: caches.NOTIFICATIONS, writable: (data) => this.notifications = writable({ ...notifyDefaults, ...deepClone(data) }) },
-      { key: caches.QUERY_NOTIFICATIONS, writable: (data) => this.query_notifications = writable(deepClone(data)) },
-      { key: caches.QUERY_FOLLOWING, writable: (data) => this.query_following = writable(deepClone(data)) },
-      { key: caches.QUERY_RECOMMENDATIONS, writable: (data) => this.query_recommendations = writable(deepClone(data)) },
+      { key: caches.GENERAL, writable: (data) => (this.general = writable({ ...generalDefaults, ...deepClone(data) })) },
+      { key: caches.USER_LISTS, writable: (data) => (this.user_lists = writable(deepClone(data))) },
+      { key: caches.HISTORY, writable: (data) => (this.history = writable({ ...historyDefaults, ...deepClone(data) })) },
+      { key: caches.NOTIFICATIONS, writable: (data) => (this.notifications = writable({ ...notifyDefaults, ...deepClone(data) })) },
+      { key: caches.QUERY_NOTIFICATIONS, writable: (data) => (this.query_notifications = writable(deepClone(data))) },
+      { key: caches.QUERY_FOLLOWING, writable: (data) => (this.query_following = writable(deepClone(data))) },
+      { key: caches.QUERY_RECOMMENDATIONS, writable: (data) => (this.query_recommendations = writable(deepClone(data))) },
       // SHARED DB
-      { key: caches.MEDIA_CACHE, writable: (data) => mediaCache = writable(deepClone(data)) },
-      { key: caches.EXTENSIONS, writable: (data) => this.extensions = writable({ ...extensionDefaults, ...deepClone(data) }) },
-      { key: caches.QUERY_MAPPINGS, writable: (data) => this.query_mappings = writable(deepClone(data)) },
-      { key: caches.QUERY_COMPOUND, writable: (data) => this.query_compound = writable(deepClone(data)) },
-      { key: caches.QUERY_EPISODES, writable: (data) => this.query_episodes = writable(deepClone(data)) },
-      { key: caches.QUERY_SEARCH_IDS, writable: (data) => this.query_search_ids = writable(deepClone(data)) },
-      { key: caches.QUERY_SEARCH, writable: (data) => this.query_search = writable(deepClone(data)) },
-      { key: caches.QUERY_RSS, writable: (data) => this.query_rss = writable(deepClone(data)) }
+      { key: caches.MEDIA_CACHE, writable: (data) => (mediaCache = writable(deepClone(data))) },
+      { key: caches.EXTENSIONS, writable: (data) => (this.extensions = writable({ ...extensionDefaults, ...deepClone(data) })) },
+      { key: caches.QUERY_MAPPINGS, writable: (data) => (this.query_mappings = writable(deepClone(data))) },
+      { key: caches.QUERY_COMPOUND, writable: (data) => (this.query_compound = writable(deepClone(data))) },
+      { key: caches.QUERY_EPISODES, writable: (data) => (this.query_episodes = writable(deepClone(data))) },
+      { key: caches.QUERY_SEARCH_IDS, writable: (data) => (this.query_search_ids = writable(deepClone(data))) },
+      { key: caches.QUERY_SEARCH, writable: (data) => (this.query_search = writable(deepClone(data))) },
+      { key: caches.QUERY_RSS, writable: (data) => (this.query_rss = writable(deepClone(data))) }
     ]
 
     /**
@@ -719,6 +746,8 @@ class Cache {
       const dbName = this.#getDatabase(key)
       const batchWriter = getBatchWriter(dbName)
       const store = key.key === caches.MEDIA_CACHE.key ? mediaCache : this[key.key]
+      const mediaReferences = key.key === caches.MEDIA_CACHE.key ? new Map() : null
+      const queryEpisodeReferences = key.key === caches.QUERY_EPISODES.key ? new Map() : null
       return store.subscribe(value => {
         const storeEntries = cacheMap.get(key.key) || {}
         // Sync user-specific fields into user_lists['entries'] when they change
@@ -726,6 +755,7 @@ class Cache {
           const updatedEntries = { ...this.user_lists.value['entries'] }
           let entriesChanged = false
           for (const [subKey, subValue] of Object.entries(value || {})) {
+            if (mediaReferences.get(subKey) === subValue) continue
             const persistValue = stripUserFields(subValue)
             const prevSubValue = storeEntries[subKey]
             if (!equal(prevSubValue, persistValue)) {
@@ -741,6 +771,7 @@ class Cache {
               delete updatedEntries[subKey]
               entriesChanged = true
             }
+            mediaReferences.set(subKey, subValue)
           }
           if (entriesChanged) {
             this.user_lists.update(lists => {
@@ -750,16 +781,20 @@ class Cache {
           }
         } else {
           for (const [subKey, subValue] of Object.entries(value || {})) {
+            if (queryEpisodeReferences?.get(subKey) === subValue) continue
             const prevSubValue = storeEntries[subKey]
             if (!equal(prevSubValue, subValue)) {
               batchWriter.enqueue(key, subKey, subValue)
               storeEntries[subKey] = deepClone(subValue)
             }
+            queryEpisodeReferences?.set(subKey, subValue)
           }
         }
         for (const subKey of Object.keys(storeEntries)) {
           if (!(subKey in (value || {}))) {
             delete storeEntries[subKey]
+            mediaReferences?.delete(subKey)
+            queryEpisodeReferences?.delete(subKey)
             remove(dbName, key, [subKey]).catch(error => debug(`Failed to remove ${subKey} from ${key.key}`, error))
           }
         }
@@ -787,7 +822,7 @@ class Cache {
   destroy() {
     this.subscribers.forEach((unsubscribe) => unsubscribe())
     this.#pending.clear()
-    batchWriters.get(this.cacheID)?.flushNow().finally(() => {
+    this.flush().finally(() => {
       openDBs.get(this.cacheID)?.then(database => database.close()).catch(() => {})
       openDBs.delete(this.cacheID)
       batchWriters.delete(this.cacheID)
@@ -808,6 +843,19 @@ class Cache {
     this.query_rss = null
     mediaCache = null
     debug(`Cache with ID ${this.cacheID} has been destroyed.`)
+  }
+
+  /**
+   * Immediately persists queued user and shared cache writes to IndexedDB.
+   *
+   * @returns {Promise<void>} Resolves after all pending writes have completed.
+   */
+  async flush() {
+    await this.isReady
+    await Promise.all([
+      batchWriters.get(this.cacheID)?.flushNow(),
+      batchWriters.get(SHARED_DB_NAME)?.flushNow()
+    ])
   }
 
   /**
@@ -834,7 +882,7 @@ class Cache {
    * @param {string} newCacheID The ID of the new cache to which data should be transferred.
    * @returns {Promise<void>} Resolves when the data has been successfully transferred and the old cache purged.
    */
-  async abandon(newCacheID){
+  async abandon(newCacheID) {
     await purge(this.cacheID)
     this.cacheID = newCacheID
     for (const value of [[caches.GENERAL, this.general.value], [caches.NOTIFICATIONS, this.notifications.value], [caches.HISTORY, this.history.value]]) {
@@ -928,9 +976,10 @@ class Cache {
    * @param {Object} data The cache object to store.
    * @returns {Promise<void>} Resolves when the data has been successfully updated.
    */
-  write(cache, key, data) {
+  async write(cache, key, data) {
+    await this.flush()
+    await set(this.#getDatabase(cache), cache, key, data)
     this.setEntry(cache, key, data)
-    return set(this.#getDatabase(cache), cache, key, data)
   }
 
   /**
@@ -1193,6 +1242,75 @@ function fillEntries(medias, userLists) {
  *
  * @param {IDBDatabase} database The database being upgraded.
  * @param {IDBTransaction} versionTx The active versionchange transaction.
+ * @param {Promise<void>} previous Earlier upgrades to finish before copying media.
+ * @returns {Promise<void>}
+ */
+function UPGRADE_V2_TO_V3(database, versionTx, previous) {
+  const history = versionTx.objectStore(caches.HISTORY.key)
+  const records = wrapRequest(history.get('animeResolvedHash'))
+  const settings = wrapRequest(versionTx.objectStore(caches.GENERAL.key).get('settings'))
+  let finished = false
+  let failure
+  let hasSource = false
+  const writing = (async () => {
+    const [, record, settingsRecord] = await Promise.all([previous, records, settings])
+    if (!record) return
+    hasSource = true
+    migrationStatus.set('Saving media to torrent files...')
+    if (!Array.isArray(record.value) || !record.value.length) return
+    const toMedia = async data => {
+      const media = data.mediaId ? await get(SHARED_DB_NAME, caches.MEDIA_CACHE, String(data.mediaId)).catch(() => null) : null
+      const locked = !!(data.locked || data.parseObject?.locked)
+      return {
+        anilist_id: data.mediaId,
+        mal_id: media?.idMal,
+        episode: data.episode ?? data.parseObject?.episode_number ?? null,
+        episodeRange: data.episodeRange ?? null,
+        season: data.season ?? data.parseObject?.anime_season ?? null,
+        failed: !locked && !!(data.failed || data.parseObject?.failed),
+        locked
+      }
+    }
+    try {
+      await TORRENT.portRequest(getTorrentSettings({ ...generalDefaults.settings, ...settingsRecord?.value }, database.name, localStorage.getItem('debug') || ''))
+      for (const entry of record.value) {
+        if (!entry.hash) continue
+        if (!entry.files?.some(file => file.mediaId)) {
+          await TORRENT.setMedia(entry.hash, await toMedia(entry), false)
+        }
+        for (const file of entry.files || []) {
+          if (file.fileHash) await TORRENT.setMedia(entry.hash, { fileHash: file.fileHash, ...await toMedia(file) }, false)
+        }
+      }
+    } finally {
+      TORRENT.reload()
+    }
+  })()
+  return new Promise((resolve, reject) => {
+    writing.then(() => { finished = true }, error => { failure = error; finished = true })
+    // Keep the upgrade pending during IPC and delete the source only in an active IDB callback.
+    const keepAlive = () => {
+      if (finished) {
+        if (failure) return reject(failure)
+        if (!hasSource) return resolve()
+        const deletion = history.delete('animeResolvedHash')
+        deletion.onsuccess = () => resolve()
+        deletion.onerror = () => reject(deletion.error)
+        return
+      }
+      const request = history.count('animeResolvedHash')
+      request.onsuccess = keepAlive
+      request.onerror = () => reject(request.error)
+    }
+    keepAlive()
+  })
+}
+
+/**
+ * Migrates existing data to the v2 store layout.
+ *
+ * @param {IDBDatabase} database The database being upgraded.
+ * @param {IDBTransaction} versionTx The active versionchange transaction.
  * @returns {Promise<void>}
  */
 async function UPGRADE_V1_TO_V2(database, versionTx) {
@@ -1430,7 +1548,7 @@ async function UPGRADE_V1_TO_V2(database, versionTx) {
 }
 
 /** @type {Cache} */
-export let cache = new Cache()
+export const cache = new Cache()
 
 /**
  * Ensures that the cache system has finished initializing before use.

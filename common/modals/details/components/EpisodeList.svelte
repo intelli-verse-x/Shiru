@@ -39,15 +39,14 @@
 </script>
 
 <script>
-  import { loadedTorrent, completedTorrents, seedingTorrents, stagingTorrents } from '@/modules/torrent.js'
+  import { getAniMappings, getMappedEpisodeCount, hasZeroEpisode, durationMap } from '@/modules/anime/anime.js'
+  import { loadedTorrent, completedTorrents, seedingTorrents, stagingTorrents, findTorrents } from '@/modules/torrent.js'
   import { since, monthDay, matchPhrase, capitalize } from '@/modules/util.js'
   import { click } from '@/modules/lib/click.js'
-  import { onMount, onDestroy } from 'svelte'
+  import { onDestroy, tick } from 'svelte'
   import { episodeByAirDate } from '@/modules/extensions/handler.js'
   import { liveAnimeProgress } from '@/modules/anime/animeprogress.js'
-  import { getHash } from '@/modules/anime/animehash.js'
   import { episodesList } from '@/modules/episodes.js'
-  import { getAniMappings, hasZeroEpisode, durationMap } from '@/modules/anime/anime.js'
   import EpisodeListSk from '@/components/skeletons/EpisodeListSk.svelte'
   import TorrentButton from '@/components/TorrentButton.svelte'
   import AudioLabel from '@/components/AudioLabel.svelte'
@@ -81,8 +80,18 @@
   $: animeProgress = liveAnimeProgress(id)
 
   let loadScroll = false
-  let maxEpisodes = 15
+  const maxEpisodes = 15
   let currentEpisodes = []
+
+  function lazyPromise(loader) {
+    let promise
+    return {
+      then(onFulfilled, onRejected) {
+        if (!promise) promise = loader()
+        return promise.then(onFulfilled, onRejected)
+      }
+    }
+  }
   function handleScroll(event) {
     const container = event.target
     if (currentEpisodes.length !== episodeList.length && container.scrollTop + container.clientHeight + 80 >= container.scrollHeight) {
@@ -97,9 +106,11 @@
     const _requestId = ++requestId
     const cancelled = () => _requestId !== requestId
 
-    const mappings = await getAniMappings(id) || {}
+    const mappings = await getAniMappings({ id, idMal }) || {}
     if (cancelled()) return null
     const { episodes, specialCount, episodeCount: newEpisodeCount } = mappings
+    const mappedEpisodeCount = getMappedEpisodeCount(media, mappings)
+    const listEpisodeCount = Math.max(episodeCount || 0, mappedEpisodeCount || 0)
     const getEpisode = (episode) => {
       const keys = Object.keys(episodes || {})
       const episodeData = episodes?.[episode] || episodes?.[`O${episode}`]
@@ -111,8 +122,8 @@
     }
 
     /** @type {{ zeroEpisode: object; airingAt: number; episode: number; filler?: boolean; dubAiring?: object; }[]} */
-    let result = Array.from({ length: (newEpisodeCount > episodeCount ? newEpisodeCount : episodeCount) }, (_, i) => ({
-      episode: i + 1, image: null, summary: null, rating: null, title: null, length: null, airdate: null, airingAt: null, filler: episodesList.getSingleEpisode(idMal, (i + 1)), dubAiring: dubbedEpisode(i, media)
+    let result = Array.from({ length: listEpisodeCount }, (_, i) => ({
+      episode: i + 1, image: null, summary: null, rating: null, title: null, length: null, airdate: null, airingAt: null, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, i + 1)), dubAiring: lazyPromise(() => dubbedEpisode(i, media))
     }))
     let alEpisodes = result
 
@@ -121,7 +132,7 @@
       const settled = media.airingSchedule
       if (settled?.length >= newEpisodeCount) {
         alEpisodes = settled.map((episode, i) => ({
-          ...episode, airingAt: episode.airingAt, episode: episode.episode, filler: episodesList.getSingleEpisode(idMal, (i + 1)), dubAiring: dubbedEpisode(i, media)
+          ...episode, airingAt: episode.airingAt, episode: episode.episode, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, i + 1)), dubAiring: lazyPromise(() => dubbedEpisode(i, media))
         }))
       } else if (settled?.length) {
         const settledMap = settled.reduce((acc, { airingAt, episode }) => {
@@ -130,7 +141,7 @@
         }, {})
         alEpisodes = alEpisodes.map((episode, i) => {
           const settledData = settledMap?.[episode.episode]
-          if (settledData) return { ...episode, airingAt: settledData.airingAt ?? episode.airingAt, episode: settledData.episode ?? episode.episode, filler: episodesList.getSingleEpisode(idMal, (i + 1)), dubAiring: dubbedEpisode(i, media)}
+          if (settledData) return { ...episode, airingAt: settledData.airingAt ?? episode.airingAt, episode: settledData.episode ?? episode.episode, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, i + 1)), dubAiring: lazyPromise(() => dubbedEpisode(i, media)) }
           return episode
         })
       }
@@ -142,21 +153,24 @@
       if (eps?.length > 0) {
         const lastId = eps[eps.length - 1].episode_id
         alEpisodes = Array.from({ length: (lastId) }, (_, i) => ({
-          episode: i + 1, image: null, summary: null, rating: null, title: (lastId <= 100 ? eps.find(e => e.episode_id === (i + 1)) : episodesList.getSingleEpisode(idMal, (i + 1)))?.title, length: null, airdate: null, airingAt: (lastId <= 100 ? eps.find(e => e.episode_id === (i + 1)) : episodesList.getSingleEpisode(idMal, (i + 1)))?.aired, filler: episodesList.getSingleEpisode(idMal, (i + 1)), dubAiring: dubbedEpisode(i, media)
+          episode: i + 1, image: null, summary: null, rating: null, title: lastId <= 100 ? eps.find(e => e.episode_id === (i + 1))?.title : null, length: null, airdate: null, airingAt: lastId <= 100 ? eps.find(e => e.episode_id === (i + 1))?.aired : null, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, i + 1)), dubAiring: lazyPromise(() => dubbedEpisode(i, media))
         }))
       } else if ((media?.status === 'RELEASING' || media?.status === 'FINISHED')) {
         alEpisodes = Array.from({ length: (media?.mediaListEntry?.progress > 0 ? media?.mediaListEntry?.progress : 1) }, (_, i) => ({
-          episode: i + 1, image: null, summary: null, rating: null, title: null, length: null, airdate: null, airingAt: null, filler: episodesList.getSingleEpisode(idMal, (i + 1)), dubAiring: dubbedEpisode(i, media)
+          episode: i + 1, image: null, summary: null, rating: null, title: null, length: null, airdate: null, airingAt: null, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, i + 1)), dubAiring: lazyPromise(() => dubbedEpisode(i, media))
         }))
       }
     }
+
+    // Airing and MAL fallbacks must respect a rejected mapping count too.
+    if (mappedEpisodeCount < newEpisodeCount) alEpisodes = alEpisodes.filter(({ episode }) => episode <= listEpisodeCount)
 
     let lastValidAirDate = null
     let lastDuration = durationMap[media?.format]
     let zeroAsFirstEpisode
     const zeroEpisode = await hasZeroEpisode(media, mappings)
     if (cancelled()) return null
-    if (zeroEpisode) alEpisodes.unshift({ episode: 0, title: zeroEpisode[0].title, airingAt: media.airingSchedule?.nodes?.find(node => node.episode === 1)?.airingAt || zeroEpisode[0].airingAt, filler: episodesList.getSingleEpisode(idMal, 0), dubAiring: dubbedEpisode(0, media)})
+    if (zeroEpisode) alEpisodes.unshift({ episode: 0, title: zeroEpisode[0].title, airingAt: media.airingSchedule?.nodes?.find(node => node.episode === 1)?.airingAt || zeroEpisode[0].airingAt, filler: lazyPromise(() => episodesList.getSingleEpisode(idMal, 0)), dubAiring: lazyPromise(() => dubbedEpisode(0, media))})
     for (const { episode, title: oldTitle, airingAt, filler, dubAiring } of alEpisodes?.length ? alEpisodes : [{ episode: 1, title: null, airingAt: null, filler: null, dubAiring: null }]) {
       if (cancelled()) return null
       const airingPromise = await airingAt
@@ -167,7 +181,7 @@
       const { image, summary, overview, rating, title: newTitle, length, airdate } = needsValidation ? episodeByAirDate(null, episodes, episode) : (episodes && getEpisode(Number(episode)) || {})
       const streamingTitle = !media.streamingEpisodes?.find(ep => episodeRx.exec(ep.title) && Number(episodeRx.exec(ep.title)[1]) === (media?.episodes + 1)) && media.streamingEpisodes?.find(ep => episodeRx.exec(ep.title) && Number(episodeRx.exec(ep.title)[1]) === episode && episodeRx.exec(ep.title)[2] && !episodeRx.exec(ep.title)[2].toLowerCase().trim().startsWith('episode'))
       const streamingThumbnail = media.streamingEpisodes?.find(ep => episodeRx.exec(ep.title) && Number(episodeRx.exec(ep.title)[1]) === episode)?.thumbnail
-      const title = episode === 0 ? oldTitle : newTitle?.en || oldTitle?.en || (await episodesList.getSingleEpisode(idMal, episode))?.title || episodeRx.exec(streamingTitle?.title)?.[2]
+      const title = episode === 0 ? oldTitle : newTitle?.en || oldTitle?.en || episodeRx.exec(streamingTitle?.title)?.[2]
       lastDuration = length || duration || lastDuration
 
       // fix any weird dates when maintainers are lazy.
@@ -207,14 +221,19 @@
       }
 
       const episodeNumber = episode - (zeroAsFirstEpisode ? 1 : 0)
-      const foundTitle = (media?.status === 'FINISHED' || (validatedAiringAt && new Date(validatedAiringAt).getTime() <= (Date.now() + 7 * 24 * 60 * 60 * 1000))) ? title || newTitle?.jp || oldTitle?.jp : null
-      result[episodeNumber - (!zeroEpisode ? 1 : 0)] = { zeroEpisode, episode: episodeNumber, image: (media?.status === 'FINISHED' || (validatedAiringAt && new Date(validatedAiringAt).getTime() <= (Date.now() + 7 * 24 * 60 * 60 * 1000))) ? episode === 0 ? zeroEpisode[0]?.thumbnail : result.some((ep) => ep.image === (image || streamingThumbnail) && ep.episode !== episodeNumber) ? null : (image || streamingThumbnail) : null, summary: (media?.status === 'FINISHED' || (validatedAiringAt && new Date(validatedAiringAt).getTime() <= Date.now()) || ((episode === 0 || episode === 1) && !validatedAiringAt && media?.status === 'RELEASING')) ? episode === 0 ? (zeroSummary || summary || overview) : result.some((ep) => ep.summary === (summary || overview) && ep.episode !== episodeNumber) ? null : (summary || overview) : `This episode ${validatedAiringAt || (media?.status === 'NOT_YET_RELEASED' && (media?.startDate?.month || media?.season || media?.seasonYear)) ? `will be released ${validatedAiringAt || media?.startDate?.month ? `${validatedAiringAt ? `on` : `in`} ${monthDay(validatedAiringAt || new Date(media.startDate.year, media.startDate.month, media.startDate.day), !validatedAiringAt)}` : `in ${media?.season ? capitalize(media?.season?.toLowerCase()) : ''} ${media?.seasonYear || ''}`}.` : ` is in production and does not have an estimated release date.`}`, rating, title: foundTitle && media?.episodes === 1 && (foundTitle.match(/ web|web |movie/i) || foundTitle.toLowerCase() === 'web') ? 'The Movie' : foundTitle, length: media?.status === 'FINISHED' || validatedAiringAt ? lastDuration : null, airdate: validatedAiringAt, airingAt: validatedAiringAt, filler, dubAiring: !zeroEpisode ? _dubAiring : dubbedEpisode(episodeNumber - 1, media) }
+      const isReleased = media?.status === 'FINISHED' || (validatedAiringAt && new Date(validatedAiringAt).getTime() <= (Date.now() + 7 * 24 * 60 * 60 * 1000))
+      const foundTitle = isReleased ? title || newTitle?.jp || oldTitle?.jp : null
+      const episodeTitle = foundTitle || (isReleased && filler ? lazyPromise(async () => (await filler)?.title || null) : null)
+      result[episodeNumber - (!zeroEpisode ? 1 : 0)] = { zeroEpisode, episode: episodeNumber, image: isReleased ? episode === 0 ? zeroEpisode[0]?.thumbnail : result.some((ep) => ep.image === (image || streamingThumbnail) && ep.episode !== episodeNumber) ? null : (image || streamingThumbnail) : null, summary: (media?.status === 'FINISHED' || (validatedAiringAt && new Date(validatedAiringAt).getTime() <= Date.now()) || ((episode === 0 || episode === 1) && !validatedAiringAt && media?.status === 'RELEASING')) ? episode === 0 ? (zeroSummary || summary || overview) : result.some((ep) => ep.summary === (summary || overview) && ep.episode !== episodeNumber) ? null : (summary || overview) : `This episode ${validatedAiringAt || (media?.status === 'NOT_YET_RELEASED' && (media?.startDate?.month || media?.season || media?.seasonYear)) ? `will be released ${validatedAiringAt || media?.startDate?.month ? `${validatedAiringAt ? `on` : `in`} ${monthDay(validatedAiringAt || new Date(media.startDate.year, media.startDate.month, media.startDate.day), !validatedAiringAt)}` : `in ${media?.season ? capitalize(media?.season?.toLowerCase()) : ''} ${media?.seasonYear || ''}`}.` : ` is in production and does not have an estimated release date.`}`, rating, title: typeof episodeTitle === 'string' && media?.episodes === 1 && (episodeTitle.match(/ web|web |movie/i) || episodeTitle.toLowerCase() === 'web') ? 'The Movie' : episodeTitle, length: media?.status === 'FINISHED' || validatedAiringAt ? lastDuration : null, airdate: validatedAiringAt, airingAt: validatedAiringAt, filler, dubAiring: !zeroEpisode ? _dubAiring : lazyPromise(() => dubbedEpisode(episodeNumber - 1, media)) }
     }
 
     if (cancelled()) return null
     if (zeroEpisode && result.length === alEpisodes.length) result = result.slice(0, -1)
-    if (media?.bannerImage && result?.some(episode => episode?.image)) result = result.map(episode => episode?.image ? episode : { ...episode, image: media?.bannerImage })
+    const bannerImage = media?.bannerImage || media?.coverImage?.extraLarge || mappings?.images?.find(image => image.coverType === 'Fanart')?.url || mappings?.images?.find(image => image.coverType === 'Poster')?.url || mappings?.images?.find(image => image.coverType === 'Banner')?.url || mappings?.images?.find(image => image.coverType === 'Clearlogo')?.url
+    if (bannerImage && result?.some(episode => episode?.image)) result = result.map(episode => episode?.image ? episode : { ...episode, image: bannerImage })
+    // eslint-disable-next-line svelte/infinite-reactive-loop
     currentEpisodes = result?.slice(0, maxEpisodes)
+    // eslint-disable-next-line svelte/infinite-reactive-loop
     episodeList = result
     return result?.length > 0 ? result : null
   }
@@ -225,6 +244,7 @@
     currentEpisodes = []
     mobileWaiting = null
     loadScroll = false
+    // eslint-disable-next-line svelte/infinite-reactive-loop
     if (!mobileList) episodeLoad = load()
   }
 
@@ -232,6 +252,7 @@
     if (episodeList?.length) {
       if (episodeOrder) currentEpisodes = episodeList.slice(0, maxEpisodes)
       else currentEpisodes = [...episodeList].reverse().slice(0, maxEpisodes)
+      tick().then(renderVisible)
     }
   }
 
@@ -260,12 +281,6 @@
     return mobileWaiting
   }
 
-  onMount(() => {
-    setInterval(() => {
-      if (!mobileList && episodeList?.length > maxEpisodes) renderVisible()
-    }, 100)
-  })
-
   onDestroy(() => {
     mobileWaiting = null
     episodeList = []
@@ -275,16 +290,16 @@
 
 <div bind:this={container} class='episode-list overflow-y-auto overflow-x-hidden {$$restProps.class}' on:scroll={handleScroll}>
   {#await (episodeLoad || mobileWait(() => episodeList?.length > 0 || !episodeList)?.then(() => episodeList))}
-    {#each Array.from({ length: media?.status !== 'NOT_YET_RELEASED' ? Math.max(Math.min(episodeCount || 0, maxEpisodes), 1) : 1 }) as _}
+    {#each Array.from({ length: media?.status !== 'NOT_YET_RELEASED' ? Math.max(Math.min(episodeCount || 0, maxEpisodes), 1) : 1 }) as _, episodeIndex (episodeIndex)}
       <div class='w-full px-20 my-20 content-visibility-auto scale h-150' class:h-165={SUPPORTS.isAndroid}>
         <EpisodeListSk />
       </div>
     {/each}
   {:then _}
     {#if episodeList}
-      {#each currentEpisodes as { zeroEpisode, episode, image, summary, rating, title, length, airdate, filler, dubAiring}, index}
+      {#each currentEpisodes as { zeroEpisode, episode, image, summary, rating, title, length, airdate, filler, dubAiring}, index (index)}
         {#await Promise.all([title, filler, dubAiring, currentEpisodes[episodeOrder ? index - 1 : index + 1]?.dubAiring])}
-          {#each Array.from({length: Math.min(episodeCount || 0, maxEpisodes)}) as _, index}
+          {#each Array.from({length: Math.min(episodeCount || 0, maxEpisodes)}) as _, index (index)}
             <div class='w-full px-20 content-visibility-auto scale h-150' class:h-165={SUPPORTS.isAndroid} class:my-20={!mobileList || index !== 0}>
               <EpisodeListSk/>
             </div>
@@ -299,7 +314,7 @@
             {@const progress = !watched && ($animeProgress?.[episode] ?? 0)}
             {@const resolvedTitle = (isSpoiler && ['strict', 'hermit'].includes($settings.spoilers)) || episodeList.filter((ep) => ep.episode < episode).some((ep) => matchPhrase(ep.title, title, 0.1, true)) ? null : title}
             {@const largeCard = image}
-            {@const resolvedHash = ($completedTorrents || $seedingTorrents || $stagingTorrents || $loadedTorrent) && getHash(media?.id, { episode, client: true, batchGuess: true }, false, true)}
+            {@const resolvedHash = ($completedTorrents || $seedingTorrents || $stagingTorrents || $loadedTorrent) && findTorrents(media?.id, episode)[0]?.infoHash}
             <div class='w-full content-visibility-auto scale my-20' class:load-in={!loadScroll} class:opacity-half={completed} class:scale-target={target} class:px-20={!target} class:px-10={target} class:h-150={!SUPPORTS.isAndroid && largeCard} class:h-165={SUPPORTS.isAndroid && largeCard}>
               <div role='button' tabindex='0' class='episode-card rounded-2 w-full h-full overflow-hidden d-flex flex-xsm-column flex-row position-relative {unreleased ? `unreleased not-allowed` : `pointer`}' class:not-reactive={!$reactive} class:smallCard={!largeCard} class:android={SUPPORTS.isAndroid}  class:border={target || hasFiller} class:bg-black={completed} class:border-secondary={hasFiller} class:bg-dark-light={!completed} use:click={() => play(media, episode)} on:contextmenu|preventDefault={() => play(media, episode, true)}>
                 <div class='unreleased-overlay position-absolute top-0 left-0 right-0 h-full pointer-events-none rounded-2' class:d-none={!unreleased}/>
@@ -311,7 +326,7 @@
                     {#if resolvedHash}
                       <div class='position-relative torrent-button-container'>
                         <div class='position-absolute top-0 right-0 text-danger icon-padding icon-shadow'>
-                          <TorrentButton class='btn btn-square shadow-none bg-transparent bd-highlight h-40 w-40' hash={[resolvedHash]} search={{ media, episode }} size={'3rem'} strokeWidth={'2.3'}/>
+                          <TorrentButton class='btn btn-square btn-highlight shadow-none bg-transparent bd-highlight h-40 w-40' hash={[resolvedHash]} search={{ media, episode }} size='3rem' strokeWidth='2.3'/>
                         </div>
                       </div>
                     {/if}
@@ -329,7 +344,7 @@
                 {/if}
                 {#if !image && resolvedHash}
                   <div class='position-absolute bottom-0 right-0 mr-5 mb-5 text-danger icon-shadow torrent-button-container' class:mb-30={hasFiller}>
-                    <TorrentButton class='btn btn-square shadow-none bg-transparent bd-highlight h-40 w-40' hash={[resolvedHash]} search={{ media, episode }} size={'3rem'} strokeWidth={'2.3'}/>
+                    <TorrentButton class='btn btn-square shadow-none bg-transparent bd-highlight h-40 w-40' hash={[resolvedHash]} search={{ media, episode }} size='3rem' strokeWidth='2.3'/>
                   </div>
                 {/if}
                 <div class='h-full w-full px-20 pt-15 d-flex flex-column'>
@@ -431,6 +446,7 @@
   }
   .title {
     display: -webkit-box !important;
+    line-clamp: 1;
     -webkit-line-clamp: 1;
     -webkit-box-orient: vertical;
     word-break: break-all;
@@ -469,9 +485,11 @@
   }
   @media (max-width: 576px) {
     .line-sm-3 {
+      line-clamp: 3 !important;
       -webkit-line-clamp: 3 !important;
     }
     .line-sm-4 {
+      line-clamp: 4 !important;
       -webkit-line-clamp: 4 !important;
     }
     .episode-card:not(.smallCard) {

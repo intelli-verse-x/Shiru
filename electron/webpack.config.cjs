@@ -1,24 +1,25 @@
 const { join, resolve } = require('path')
+const { readFileSync } = require('node:fs')
+const { load } = require('js-yaml')
+const { spawn } = require('node:child_process')
 const HtmlWebpackPlugin = require('html-webpack-plugin')
-
-const mode = process.env.NODE_ENV?.trim() || 'development'
-
 const commonConfig = require('common/webpack.config.cjs')
+const { electronDownload } = load(readFileSync(join(__dirname, 'electron-builder.yml'), 'utf8'))
 
-/** @type {import('webpack').WebpackOptionsNormalized[]} */
+const nodeEnv = process.env.NODE_ENV?.trim()
+const mode = nodeEnv === 'production' || nodeEnv === 'none' ? nodeEnv : 'development'
+
+/** @type {import('webpack').Configuration[]} */
 module.exports = [
   {
+    name: 'background',
     devtool: 'source-map',
-    stats: { warnings: false },
     entry: join(__dirname, 'src', 'background', 'background.js'),
     output: {
       path: join(__dirname, 'build'),
       filename: 'background.js'
     },
     mode,
-    optimization: {
-      concatenateModules: { commonjs: false }
-    },
     externals: {
       'utp-native': 'require("utp-native")',
       'fs-native-extensions': 'commonjs2 fs-native-extensions',
@@ -40,8 +41,31 @@ module.exports = [
       }
     },
     plugins: [new HtmlWebpackPlugin({ filename: 'background.html' })],
-    target: 'electron39.0-renderer',
+    target: 'electron45.0-renderer',
     devServer: {
+      onListening(server) {
+        if (process.env.DEV_ENV !== 'electron') return
+        process.env.ELECTRON_MIRROR ??= electronDownload.mirror
+        process.env.ELECTRON_CUSTOM_DIR ??= electronDownload.customDir
+        process.env.electron_use_remote_checksums ??= '1'
+        let electron
+        const startElectron = stats => {
+          if (electron || stats.hasErrors()) return
+          electron = spawn(
+            require('electron'),
+            [join(__dirname, 'build/main.js')],
+            { cwd: __dirname, stdio: 'inherit' }
+          )
+          electron.once('error', error => {
+            console.error(error)
+            process.exit(1)
+          })
+          electron.once('exit', code => process.exit(code ?? 0))
+        }
+        process.once('exit', () => electron?.kill())
+        server.compiler.hooks.done.tap('StartElectron', startElectron)
+        server.middleware.waitUntilValid(startElectron)
+      },
       devMiddleware: {
         writeToDisk: true
       },
@@ -59,22 +83,28 @@ module.exports = [
       port: 5000
     }
   },
-  commonConfig(__dirname),
+  commonConfig(__dirname, {
+    'jassub/dist/jassub-worker.wasm.js$': false
+  }, 'browser', 'app'),
   {
+    name: 'preload',
     devtool: 'source-map',
-    stats: { warnings: false },
     entry: join(__dirname, 'src', 'preload', 'preload.js'),
     output: {
       path: join(__dirname, 'build'),
       filename: 'preload.js'
     },
     resolve: {
-      aliasFields: []
+      aliasFields: [],
+      alias: {
+        '@client': resolve(__dirname, '..', 'client')
+      }
     },
     mode,
-    target: 'electron39.0-preload'
+    target: 'electron45.0-preload'
   },
   {
+    name: 'main',
     devtool: 'source-map',
     entry: join(__dirname, 'src', 'main', 'main.js'),
     output: {
@@ -91,6 +121,6 @@ module.exports = [
       }
     },
     mode,
-    target: 'electron39.0-main'
+    target: 'electron45.0-main'
   }
 ]
