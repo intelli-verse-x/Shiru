@@ -520,8 +520,8 @@
       <button type='button' use:click={rescan} aria-label='Rescan cache' disabled={disableRescan || $loadingSession} title={disableRescan ? 'Enable Persist Files or Increase Seeding Limit' : $loadingSession ? 'Rescanning Cache...' : 'Rescan Cache'} class='btn btn-primary d-flex align-items-center justify-content-center flex-shrink-0 ml-10 mr-10 px-0 px-md-15 font-scale-16 h-40 w-40 w-md-auto' class:cursor-wait={$loadingSession}>
         <RefreshCw class='mr-md-10' size='1.8rem' strokeWidth='2.4'/><span class='d-none d-md-inline'>Rescan</span>
       </button>
-      <button type='button' use:click={handleMedia} aria-label='Add media or torrent files' disabled={disableRescan || $loadingSession} title='Add Media File(s) or Add Torrent File(s)' class='btn btn-primary d-flex align-items-center justify-content-center flex-shrink-0 mr-20 px-0 px-md-15 font-scale-16 h-40 w-40 w-md-auto' class:cursor-wait={$loadingSession}>
-        <HardDriveUpload class='mr-md-10' size='1.8rem' strokeWidth='2.4'/><span class='d-none d-md-inline'>Add File</span>
+      <button type='button' use:click={handleMedia} aria-label='Add torrent files' disabled={disableRescan || $loadingSession} title='Add Torrent File(s)' class='btn btn-primary d-flex align-items-center justify-content-center flex-shrink-0 mr-20 px-0 px-md-15 font-scale-16 h-40 w-40 w-md-auto' class:cursor-wait={$loadingSession}>
+        <HardDriveUpload class='mr-md-10' size='1.8rem' strokeWidth='2.4'/><span class='d-none d-md-inline'>Add Torrent</span>
       </button>
     </div>
   </div>
